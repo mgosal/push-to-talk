@@ -1,0 +1,54 @@
+[package]
+name = "push-to-talk"
+version = "0.1.0"
+edition = "2021"
+description = "Push-to-talk voice typing for macOS"
+license = "BSD-2-Clause"
+repository = "https://github.com/mgosal/push-to-talk"
+
+[dependencies]
+# macOS native APIs via objc2
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSObject", "NSString", "NSThread", "NSRunLoop",
+    "NSNotification", "NSData", "NSTimer",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication", "NSRunningApplication", "NSResponder",
+    "NSStatusBar", "NSStatusItem", "NSStatusBarButton",
+    "NSMenu", "NSMenuItem", "NSImage", "NSEvent", "NSSound",
+    "NSPasteboard", "NSWindow", "NSView", "NSButton", "NSControl",
+    "NSFont", "NSColor", "NSTextField", "NSTextView", "NSText",
+    "NSSecureTextField", "NSPopUpButton",
+    "NSTableView", "NSTableColumn", "NSScrollView", "NSCell",
+    "NSSavePanel", "NSOpenPanel", "NSPanel",
+] }
+block2 = "0.6"
+
+# Core Graphics for CGEvent tap (global hotkey) and keystroke injection
+core-graphics = "0.24"
+core-foundation = "0.10"
+
+# HTTP client for OpenAI-compatible API
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+# SQLite for dictation history & corrections
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Config and serialization
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+dirs = "6"
+
+# Process signals (SIGTERM for ffmpeg)
+libc = "0.2"
+
+# Regex for calibration sentence parsing
+regex = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

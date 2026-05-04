@@ -1,0 +1,15 @@
+/target/
+*.app/
+*.db
+*.sqlite
+*.sqlite3
+*.wav
+*.m4a
+*.mp3
+.DS_Store
+.accessibility-prompted
+.microphone-checked
+api-key
+config.toml
+speaker-profile.md
+transcripts/
