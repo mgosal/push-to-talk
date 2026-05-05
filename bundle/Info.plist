@@ -34,7 +34,7 @@
     <true/>
 
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>14.0</string>
 
     <key>NSMicrophoneUsageDescription</key>
     <string>Push to Talk records audio for voice transcription.</string>

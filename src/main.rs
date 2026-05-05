@@ -18,7 +18,6 @@ mod transcribe;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -56,7 +55,7 @@ struct DelegateIvars {
     provider_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     onboarding_status_label: RefCell<Option<Retained<NSTextField>>>,
     mode: Cell<AppMode>,
-    recording_child: RefCell<Option<Child>>,
+    recording: RefCell<Option<audio::NativeRecorder>>,
     recording_path: RefCell<Option<PathBuf>>,
     recording_start: Cell<Option<Instant>>,
     transcription_count: Cell<u32>,
@@ -234,7 +233,7 @@ impl AppDelegate {
             provider_popup: RefCell::new(None),
             onboarding_status_label: RefCell::new(None),
             mode: Cell::new(AppMode::Idle),
-            recording_child: RefCell::new(None),
+            recording: RefCell::new(None),
             recording_path: RefCell::new(None),
             recording_start: Cell::new(None),
             transcription_count: Cell::new(0),
@@ -253,7 +252,7 @@ impl AppDelegate {
 
     fn should_show_onboarding(&self) -> bool {
         let missing_key = with_config(|c| c.api_key().is_none()).unwrap_or(true);
-        missing_key || !hotkey::is_accessibility_trusted() || !config::microphone_was_checked()
+        missing_key || !hotkey::is_accessibility_trusted() || !audio::microphone_access_granted()
     }
 
     fn start_hotkey_monitor_if_allowed(&self) {
@@ -516,10 +515,10 @@ impl AppDelegate {
         } else {
             "shortcut access needed"
         };
-        let mic_status = if config::microphone_was_checked() {
-            "microphone checked"
-        } else {
-            "microphone not checked"
+        let mic_status = match audio::microphone_permission() {
+            audio::MicrophonePermission::Granted => "microphone granted",
+            audio::MicrophonePermission::Denied => "microphone denied",
+            audio::MicrophonePermission::Undetermined => "microphone access needed",
         };
         let text = format!("{key_status} | {shortcut_status} | {mic_status}");
         if let Some(label) = self.ivars().onboarding_status_label.borrow().as_ref() {
@@ -562,12 +561,11 @@ impl AppDelegate {
 
     fn request_microphone_access_from_setup(&self) {
         self.update_ui("🟡", "Requesting microphone access…");
-        let ffmpeg = with_config(|c| c.ffmpeg()).unwrap_or_else(|| "ffmpeg".into());
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         std::thread::Builder::new()
             .name("mic-permission".into())
             .spawn(move || {
-                let result = audio::request_microphone_access(&ffmpeg);
+                let result = audio::request_microphone_access();
                 let _ = tx.send(result);
             })
             .ok();
@@ -584,7 +582,6 @@ impl AppDelegate {
             *MIC_RX.lock().unwrap() = None;
             match result {
                 Ok(()) => {
-                    config::mark_microphone_checked();
                     self.update_ui("⚪", "✓ Microphone access enabled");
                 }
                 Err(e) => {
@@ -927,7 +924,7 @@ impl AppDelegate {
         self.ivars().mode.set(AppMode::Recording);
         audio::play_tone(audio::Tone::Start);
 
-        let (ffmpeg, audio_dir) = match with_config(|c| (c.ffmpeg(), c.audio_dir())) {
+        let audio_dir = match with_config(|c| c.audio_dir()) {
             Some(v) => v,
             None => return,
         };
@@ -938,16 +935,19 @@ impl AppDelegate {
             .as_millis();
         let path = audio_dir.join(format!("ptt-{ts}.wav"));
 
-        if let Some(child) = audio::start_recording(&ffmpeg, &path) {
-            *self.ivars().recording_child.borrow_mut() = Some(child);
-            *self.ivars().recording_path.borrow_mut() = Some(path);
-            self.ivars().recording_start.set(Some(Instant::now()));
-            self.update_ui("🔴", "Recording...");
-            self.update_toggle_title("Stop Recording");
-        } else {
-            self.ivars().mode.set(AppMode::Idle);
-            audio::play_tone(audio::Tone::Discard);
-            self.update_ui("⚪", "Recording failed — check ffmpeg");
+        match audio::start_recording(&path) {
+            Ok(recording) => {
+                *self.ivars().recording.borrow_mut() = Some(recording);
+                *self.ivars().recording_path.borrow_mut() = Some(path);
+                self.ivars().recording_start.set(Some(Instant::now()));
+                self.update_ui("🔴", "Recording...");
+                self.update_toggle_title("Stop Recording");
+            }
+            Err(e) => {
+                self.ivars().mode.set(AppMode::Idle);
+                audio::play_tone(audio::Tone::Discard);
+                self.update_ui("⚪", &format!("Recording failed — {e}"));
+            }
         }
     }
 
@@ -957,8 +957,8 @@ impl AppDelegate {
             return;
         }
 
-        if let Some(mut child) = self.ivars().recording_child.borrow_mut().take() {
-            audio::stop_recording(&mut child);
+        if let Some(recording) = self.ivars().recording.borrow_mut().take() {
+            let _ = recording.stop();
         }
 
         let path = self.ivars().recording_path.borrow().clone();
@@ -1330,14 +1330,13 @@ struct TranscribeResult {
 }
 
 fn do_transcription(audio_path: &PathBuf) -> TranscribeResult {
-    let (endpoint, model, api_key, profile, ffprobe, max_wps, db, max_retries, retry_backoff, transcripts_dir) =
+    let (endpoint, model, api_key, profile, max_wps, db, max_retries, retry_backoff, transcripts_dir) =
         match with_config(|c| {
             (
                 c.api.endpoint.clone(),
                 c.api.model.clone(),
                 c.api_key(),
                 c.speaker_profile(),
-                c.ffprobe(),
                 c.transcription.max_wps,
                 c.db_path(),
                 c.api.max_retries,
@@ -1345,10 +1344,10 @@ fn do_transcription(audio_path: &PathBuf) -> TranscribeResult {
                 c.transcripts_dir(),
             )
         }) {
-            Some((endpoint, model, Some(key), profile, ffprobe, max_wps, db, retries, backoff, tdir)) => {
-                (endpoint, model, key, profile, ffprobe, max_wps, db, retries, backoff, tdir)
+            Some((endpoint, model, Some(key), profile, max_wps, db, retries, backoff, tdir)) => {
+                (endpoint, model, key, profile, max_wps, db, retries, backoff, tdir)
             }
-            Some((_, _, None, _, _, _, db, _, _, _)) => {
+            Some((_, _, None, _, _, db, _, _, _)) => {
                 let err = "No API key configured".to_string();
                 db::record(&db, audio_path.to_str(), None, "error", Some(&err), None, None, None);
                 return TranscribeResult { text: None, latency: 0.0, error: Some(err), hallucination: false };
@@ -1358,7 +1357,7 @@ fn do_transcription(audio_path: &PathBuf) -> TranscribeResult {
             }
         };
 
-    match transcribe::transcribe(&endpoint, &model, &api_key, &profile, &ffprobe, audio_path, max_retries, &retry_backoff) {
+    match transcribe::transcribe(&endpoint, &model, &api_key, &profile, audio_path, max_retries, &retry_backoff) {
         Ok(result) => {
             let hallucination = transcribe::is_hallucination(&result.text, result.duration_s, max_wps);
 

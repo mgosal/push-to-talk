@@ -2,7 +2,7 @@
 
 Push-to-talk voice typing for macOS. Hold a key, speak, release — text appears at your cursor.
 
-Native Rust binary. No Python, no Electron. ~3.4 MB release binary, with `ffmpeg` used for audio capture.
+Native Rust binary. No Python, no Electron. Audio capture uses native macOS AVFAudio APIs.
 
 ## Name
 
@@ -10,9 +10,8 @@ The name nods to Wiz Khalifa's "Black and Yellow": "No keys, push to start."
 
 ## Requirements
 
-- macOS 13+ (Apple Silicon or Intel)
+- macOS 14+ (Apple Silicon or Intel)
 - [Rust toolchain](https://rustup.rs/) (to build)
-- [ffmpeg](https://formulae.brew.sh/formula/ffmpeg) (for audio recording)
 - An API key for any OpenAI-compatible audio endpoint
 
 ## Quick start
@@ -155,6 +154,10 @@ All config lives in `~/.config/push-to-talk/config.toml`. Every field has a defa
 
 See [`config.example.toml`](config.example.toml) for the full reference with comments.
 
+### Audio capture
+
+The app records directly through macOS AVFAudio. There is no external audio recorder dependency to install or configure. Temporary recordings are written as WAV files in the configured `audio_dir` or the system temp directory.
+
 ### API key resolution order
 
 1. `key = "..."` in config.toml (inline)
@@ -193,11 +196,23 @@ make bundle    # creates Push to Talk.app in the project root
 
 | Target | Description |
 |--------|-------------|
+| `make check` | Type-check the Rust binary |
+| `make test` | Run Rust tests |
 | `make build` | Build release binary |
 | `make bundle` | Build + create ad-hoc signed `.app` bundle |
 | `make install` | Build + bundle + copy to `/Applications` |
 | `make uninstall` | Remove from `/Applications` |
 | `make clean` | Remove build artifacts and bundle |
+
+### Verification
+
+```bash
+make check
+make test
+make bundle
+```
+
+`make bundle` produces a release build, copies it into `Push to Talk.app`, and ad-hoc signs the app bundle. The project sets `MACOSX_DEPLOYMENT_TARGET=14.0` for Cargo builds.
 
 ## Privacy
 
@@ -222,6 +237,11 @@ API keys are stored locally in `~/.config/push-to-talk/api-key` by default. Dict
 └──────────────┘  └──────────────┘
        │ triggers
 ┌──────┴───────┐
+│ Native Audio  │  AVAudioRecorder → WAV
+│ Recorder      │  AVAudioApplication permission
+└──────┬───────┘
+       │ sends WAV
+┌──────┴───────┐
 │  Transcribe   │  Background thread
 │  Thread       │  reqwest → API → paste → SQLite → notify
 └──────────────┘
@@ -237,12 +257,7 @@ Fix: open **Setup…** from the menubar and use **Open Accessibility** / **Open 
 
 ### No audio recorded
 
-Check that ffmpeg is installed and accessible:
-
-```bash
-which ffmpeg   # should return a path
-ffmpeg -f avfoundation -list_devices true -i "" 2>&1 | grep -i audio
-```
+Open **Setup…** from the menubar and use **Enable Microphone**. If access is denied, use **Open Microphone** and grant permission in System Settings.
 
 You can also reopen **Setup…** and click **Enable Microphone** to trigger the microphone approval step deliberately.
 

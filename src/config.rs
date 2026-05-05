@@ -37,10 +37,6 @@ pub struct ApiConfig {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AudioConfig {
-    /// Path to ffmpeg binary. Default: "ffmpeg" (found via PATH).
-    pub ffmpeg: String,
-    /// Path to ffprobe binary. Default: "ffprobe" (found via PATH).
-    pub ffprobe: String,
     /// Minimum recording duration in seconds. Shorter recordings are discarded.
     pub min_duration_s: f64,
 }
@@ -98,8 +94,6 @@ impl Default for ApiConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            ffmpeg: "ffmpeg".into(),
-            ffprobe: "ffprobe".into(),
             min_duration_s: 0.4,
         }
     }
@@ -232,57 +226,7 @@ pub fn save_api_key(provider: Provider, api_key: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn microphone_marker_path() -> PathBuf {
-    config_dir().join(".microphone-checked")
-}
-
-pub fn microphone_was_checked() -> bool {
-    microphone_marker_path().exists()
-}
-
-pub fn mark_microphone_checked() {
-    let _ = std::fs::create_dir_all(config_dir());
-    let _ = std::fs::write(microphone_marker_path(), "");
-}
-
 // ── Resolved accessors ───────────────────────────────────────────────
-
-/// Common macOS paths where ffmpeg/ffprobe might live.
-/// Apps launched via `open` get a minimal PATH that excludes Homebrew.
-const BINARY_SEARCH_PATHS: &[&str] = &[
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-];
-
-/// Resolve a binary name to an absolute path.
-/// If the configured value is already absolute, use it directly.
-/// Otherwise, check PATH first, then probe common macOS locations.
-fn resolve_binary(name: &str) -> String {
-    // Already an absolute path
-    if name.starts_with('/') {
-        return name.to_string();
-    }
-
-    // Check ~/.local/bin first (common for user installs)
-    if let Some(home) = dirs::home_dir() {
-        let local = home.join(".local/bin").join(name);
-        if local.exists() {
-            return local.to_string_lossy().into_owned();
-        }
-    }
-
-    // Probe common system paths
-    for dir in BINARY_SEARCH_PATHS {
-        let candidate = Path::new(dir).join(name);
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    // Fall back to the bare name (relies on PATH)
-    name.to_string()
-}
 
 impl Config {
     /// Resolve the API key from inline value or key_file.
@@ -363,15 +307,6 @@ impl Config {
         resolve_path(&self.storage.socket_path)
     }
 
-    /// Resolve ffmpeg binary path.
-    pub fn ffmpeg(&self) -> String {
-        resolve_binary(&self.audio.ffmpeg)
-    }
-
-    /// Resolve ffprobe binary path.
-    pub fn ffprobe(&self) -> String {
-        resolve_binary(&self.audio.ffprobe)
-    }
 }
 
 /// Resolve a path string: expand `~`, resolve relative to config dir.

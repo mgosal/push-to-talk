@@ -28,10 +28,7 @@ max_retries = 3
 retry_backoff = [1, 3, 5]
 
 [audio]
-# Path to ffmpeg/ffprobe. Default: found via PATH.
-# ffmpeg = "/opt/homebrew/bin/ffmpeg"
-# ffprobe = "/opt/homebrew/bin/ffprobe"
-
+# Native macOS AVFAudio recording. No external recorder binary is required.
 # Minimum recording duration (seconds). Shorter = discard.
 min_duration_s = 0.4
 
@@ -53,7 +50,7 @@ max_wps = 5.0
 # Default: ~/.config/push-to-talk/history.db
 # db = "~/my-project/ptt-history.db"
 
-# Temporary audio recording directory. Default: system temp.
+# Temporary native WAV recording directory. Default: system temp.
 # audio_dir = "/tmp/ptt"
 
 # PID file for detecting running instance. Default: /tmp/ptt.pid

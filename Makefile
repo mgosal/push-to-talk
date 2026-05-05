@@ -3,10 +3,18 @@ BUNDLE     := $(APP_NAME).app
 BINARY     := push-to-talk
 IDENTIFIER := com.mgosal.push-to-talk
 INSTALL_DIR := /Applications
+MACOSX_DEPLOYMENT_TARGET := 14.0
+export MACOSX_DEPLOYMENT_TARGET
 
-.PHONY: build bundle install uninstall clean
+.PHONY: check test build bundle install uninstall clean
 
 # ── Build ──────────────────────────────────────────────────────────────
+
+check:
+	cargo check
+
+test:
+	cargo test
 
 build:
 	cargo build --release

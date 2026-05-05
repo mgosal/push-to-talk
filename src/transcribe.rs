@@ -105,7 +105,6 @@ pub fn transcribe(
     model: &str,
     api_key: &str,
     speaker_profile: &str,
-    ffprobe: &str,
     audio_path: &Path,
     max_retries: u32,
     retry_backoff: &[f64],
@@ -210,7 +209,7 @@ pub fn transcribe(
         let latency_s = start.elapsed().as_secs_f64();
 
         // Get audio duration for WPS calc
-        let duration_s = crate::audio::get_duration(ffprobe, audio_path).unwrap_or(0.0);
+        let duration_s = crate::audio::get_duration(audio_path).unwrap_or(0.0);
         let word_count = text.split_whitespace().count() as f64;
         let wps = if duration_s > 0.0 { word_count / duration_s } else { 0.0 };
 

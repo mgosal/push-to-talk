@@ -11,5 +11,6 @@
 .microphone-checked
 api-key
 config.toml
+!.cargo/config.toml
 speaker-profile.md
 transcripts/

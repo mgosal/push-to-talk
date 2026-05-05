@@ -1,7 +1,19 @@
-//! Audio recording (ffmpeg) and system sound playback.
+//! Audio recording and system sound playback.
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::Bool;
+use objc2::AnyThread;
+use objc2_avf_audio::{
+    AVAudioApplication, AVAudioApplicationRecordPermission, AVAudioCommonFormat, AVAudioFile,
+    AVAudioFormat, AVAudioRecorder,
+};
+use objc2_foundation::{NSError, NSString, NSURL};
 
 // System sound paths
 const TONE_START: &str = "/System/Library/Sounds/Tink.aiff";
@@ -34,79 +46,126 @@ pub fn play_tone(tone: Tone) {
         .spawn();
 }
 
-/// Start recording audio to a WAV file. Returns the ffmpeg child process.
-pub fn start_recording(ffmpeg: &str, output_path: &Path) -> Option<Child> {
-    match Command::new(ffmpeg)
-        .args([
-            "-f", "avfoundation",
-            "-i", ":default",
-            "-c:a", "pcm_s16le",
-            "-ar", "16000",
-            "-ac", "1",
-            "-y",
-        ])
-        .arg(output_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => Some(child),
-        Err(e) => {
-            eprintln!("[ptt] Failed to start ffmpeg: {e}");
-            None
+pub struct NativeRecorder {
+    recorder: Retained<AVAudioRecorder>,
+}
+
+impl NativeRecorder {
+    pub fn stop(self) -> f64 {
+        let duration = unsafe { self.recorder.currentTime() };
+        unsafe {
+            self.recorder.stop();
+        }
+        duration
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicrophonePermission {
+    Undetermined,
+    Denied,
+    Granted,
+}
+
+fn file_url(path: &Path) -> Result<Retained<NSURL>, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))?;
+    Ok(NSURL::fileURLWithPath(&NSString::from_str(path)))
+}
+
+fn ns_error_message(error: &NSError) -> String {
+    error.localizedDescription().to_string()
+}
+
+/// Start recording 16 kHz mono signed 16-bit PCM audio to a WAV file.
+pub fn start_recording(output_path: &Path) -> Result<NativeRecorder, String> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create audio directory: {e}"))?;
+    }
+
+    let url = file_url(output_path)?;
+    let format = unsafe {
+        AVAudioFormat::initWithCommonFormat_sampleRate_channels_interleaved(
+            AVAudioFormat::alloc(),
+            AVAudioCommonFormat::PCMFormatInt16,
+            16_000.0,
+            1,
+            true,
+        )
+    }
+    .ok_or_else(|| "failed to create 16 kHz mono PCM audio format".to_string())?;
+
+    let recorder = unsafe {
+        AVAudioRecorder::initWithURL_format_error(AVAudioRecorder::alloc(), &url, &format)
+    }
+    .map_err(|e| format!("failed to create audio recorder: {}", ns_error_message(&e)))?;
+
+    if !unsafe { recorder.prepareToRecord() } {
+        return Err("audio recorder could not prepare the output file".into());
+    }
+    if !unsafe { recorder.record() } {
+        return Err("audio recorder could not start recording".into());
+    }
+
+    Ok(NativeRecorder { recorder })
+}
+
+pub fn microphone_permission() -> MicrophonePermission {
+    let permission = unsafe { AVAudioApplication::sharedInstance().recordPermission() };
+    if permission == AVAudioApplicationRecordPermission::Granted {
+        MicrophonePermission::Granted
+    } else if permission == AVAudioApplicationRecordPermission::Denied {
+        MicrophonePermission::Denied
+    } else {
+        MicrophonePermission::Undetermined
+    }
+}
+
+pub fn microphone_access_granted() -> bool {
+    microphone_permission() == MicrophonePermission::Granted
+}
+
+pub fn request_microphone_access() -> Result<(), String> {
+    match microphone_permission() {
+        MicrophonePermission::Granted => return Ok(()),
+        MicrophonePermission::Denied => {
+            return Err("microphone access is denied in System Settings".into());
+        }
+        MicrophonePermission::Undetermined => {}
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let block = RcBlock::new(move |granted: Bool| {
+        let _ = tx.send(granted.as_bool());
+    });
+
+    unsafe {
+        AVAudioApplication::requestRecordPermissionWithCompletionHandler(&block);
+    }
+
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("microphone access was not granted".into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("microphone permission request timed out".into())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("microphone permission request was interrupted".into())
         }
     }
 }
 
-/// Trigger macOS microphone permission through the same ffmpeg path used for
-/// real recordings, then capture a tiny sample to verify access.
-pub fn request_microphone_access(ffmpeg: &str) -> Result<(), String> {
-    let output = Command::new(ffmpeg)
-        .args([
-            "-nostdin",
-            "-f", "avfoundation",
-            "-i", ":default",
-            "-t", "0.2",
-            "-f", "null",
-            "-",
-        ])
-        .stdout(Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to start ffmpeg: {e}"))?;
-
-    if output.status.success() {
-        return Ok(());
+/// Get audio duration in seconds using AVAudioFile metadata.
+pub fn get_duration(path: &Path) -> Option<f64> {
+    let url = file_url(path).ok()?;
+    let file = unsafe { AVAudioFile::initForReading_error(AVAudioFile::alloc(), &url).ok()? };
+    let frames = unsafe { file.length() };
+    let sample_rate = unsafe { file.processingFormat().sampleRate() };
+    if frames > 0 && sample_rate > 0.0 {
+        Some(frames as f64 / sample_rate)
+    } else {
+        None
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = stderr
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("microphone test failed");
-    Err(detail.to_string())
-}
-
-/// Stop recording by sending SIGTERM to ffmpeg.
-pub fn stop_recording(child: &mut Child) {
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGTERM);
-    }
-    let _ = child.wait();
-}
-
-/// Get audio duration in seconds using ffprobe.
-pub fn get_duration(ffprobe: &str, path: &Path) -> Option<f64> {
-    let output = Command::new(ffprobe)
-        .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-
-    let s = String::from_utf8_lossy(&output.stdout);
-    s.trim().parse().ok()
 }
