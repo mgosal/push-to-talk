@@ -48,7 +48,9 @@ The speaker profile teaches the transcription model your accent, vocabulary, and
 
 **Option A: Automated wizard** (recommended)
 
-Click **"Set Up Speaker Profile…"** in the menubar menu. Select a text file containing vocabulary, project names, and writing preferences. The app calls the LLM to generate a personalised profile and opens it in your editor for review.
+Click **"Set Up Speaker Profile…"** in the menubar menu. Select a text file containing vocabulary, project names, writing preferences, and any reusable personal context you want the dictation model to remember. The app calls the LLM to generate a compact personalised profile, saves it to `~/.config/push-to-talk/speaker-profile.md`, and opens it in your editor for review.
+
+The generated profile is used automatically for future dictation. You only need to set `transcription.speaker_profile` manually if you want to use a different profile file.
 
 **Option B: Manual**
 

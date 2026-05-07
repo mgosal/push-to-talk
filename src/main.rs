@@ -1046,7 +1046,10 @@ impl AppDelegate {
         };
 
         self.update_ui("🟡", "Generating speaker profile…");
-        notification::notify_success("Generating your speaker profile from the uploaded document…", 0.0);
+        notification::notify(
+            "Speaker Profile",
+            "Generating your profile from the uploaded document...",
+        );
 
         let (endpoint, model, api_key) = match with_config(|c| {
             (c.api.endpoint.clone(), c.api.model.clone(), c.api_key())
@@ -1084,8 +1087,9 @@ impl AppDelegate {
                     match calibrate::save_profile(&profile_text) {
                         Ok(path) => {
                             self.update_ui("⚪", "✓ Speaker profile created");
-                            notification::notify_success(
-                                &format!("Profile saved to {}", path.display()), 0.0
+                            notification::notify(
+                                "Speaker Profile Ready",
+                                &format!("Saved and ready for dictation: {}", path.display()),
                             );
                             eprintln!("[ptt] Speaker profile saved to {}", path.display());
                             // Open in default editor

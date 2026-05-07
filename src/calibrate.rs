@@ -11,10 +11,11 @@ use crate::config;
 
 // ── Profile Generation (Onboarding) ──────────────────────────────────
 
-const PROFILE_GENERATION_PROMPT: &str = r#"You are building a speaker profile for a voice transcription system.
+const PROFILE_GENERATION_PROMPT: &str = r#"You are building a compact, durable speaker profile for a voice transcription system.
 The user will provide vocabulary, writing preferences, project context, or
-free-form notes. Generate a speaker profile in markdown that will help a
-transcription model produce accurate output.
+free-form notes. Generate a markdown profile that works as a portable
+"context file" for the user: concise enough to stay useful, specific enough to
+help future transcription and personalization.
 
 Do not infer or include sensitive personal attributes such as age, gender,
 ethnicity, nationality, precise location, health, religion, or politics. Include
@@ -22,6 +23,10 @@ accent or dialect notes only when the user explicitly provides them and they are
 useful for transcription.
 
 The profile MUST include these sections:
+
+## Profile Summary
+- 3-6 bullets capturing the user's recurring work, vocabulary, and dictation
+  preferences. Keep it factual and grounded in the provided text.
 
 ## Transcription Context
 - Language, optional accent/dialect notes, register, and any explicit context
@@ -43,6 +48,14 @@ The profile MUST include these sections:
 
 ## Spelling Preferences
 - British vs American English, specific word preferences
+
+## Personalization Notes
+- Stable preferences that should make future onboarding feel tailored, such as
+  preferred terminology, recurring projects, and writing conventions
+- Leave gaps explicit as "Unknown" rather than inventing detail
+
+## Review Checklist
+- 3-5 short bullets the user should confirm or fill in after generation
 
 Output ONLY the markdown profile. No preamble, no explanation.
 Start with `# Speaker Profile`."#;
@@ -95,7 +108,7 @@ pub fn generate_profile(
 pub fn save_profile(profile_text: &str) -> Result<PathBuf, String> {
     let dir = config::config_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("speaker-profile.md");
+    let path = config::default_speaker_profile_path();
     std::fs::write(&path, profile_text)
         .map_err(|e| format!("Failed to write profile: {e}"))?;
     Ok(path)
@@ -103,13 +116,12 @@ pub fn save_profile(profile_text: &str) -> Result<PathBuf, String> {
 
 /// Check if a speaker profile exists.
 pub fn profile_exists() -> bool {
-    let dir = config::config_dir();
-    dir.join("speaker-profile.md").exists()
+    config::default_speaker_profile_path().exists()
 }
 
 /// Read the current speaker profile, if any.
 pub fn read_profile() -> Option<String> {
-    let path = config::config_dir().join("speaker-profile.md");
+    let path = config::default_speaker_profile_path();
     std::fs::read_to_string(path).ok()
 }
 
@@ -391,7 +403,7 @@ pub fn analyse_corrections(
 
 /// Append new sections to the existing speaker profile.
 pub fn append_to_profile(new_sections: &str) -> Result<(), String> {
-    let path = config::config_dir().join("speaker-profile.md");
+    let path = config::default_speaker_profile_path();
     let mut content = std::fs::read_to_string(&path)
         .unwrap_or_default();
 

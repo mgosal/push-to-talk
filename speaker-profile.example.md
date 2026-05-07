@@ -4,10 +4,15 @@
 # and domain context. Keep it focused on transcription cues, not sensitive
 # personal details.
 #
-# Save your profile as a text or markdown file and point to it in config.toml:
-#
-#   [transcription]
-#   speaker_profile = "~/.config/push-to-talk/speaker-profile.md"
+# Save your profile as ~/.config/push-to-talk/speaker-profile.md. The app will
+# use that generated profile automatically. Set transcription.speaker_profile in
+# config.toml only when you want to use a different file.
+
+## Profile Summary
+
+- Recurring work: add the topics, projects, or workflows you dictate about
+- Preferred output: add whether you want terse notes, polished prose, or literal drafts
+- Important context: add stable facts that help future dictation without adding sensitive details
 
 ## About the speaker
 
@@ -28,3 +33,9 @@ These words appear frequently and should be preferred when the audio is ambiguou
 - Use the spelling style you prefer
 - "email" not "e-mail"
 - "setup" (noun) vs "set up" (verb)
+
+## Personalization notes
+
+- Preferred terminology: add words the model should favor when audio is ambiguous
+- Reusable context: add non-sensitive background that would save repeated explanation
+- Unknowns: leave anything uncertain blank instead of guessing

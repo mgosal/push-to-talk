@@ -130,6 +130,11 @@ pub fn config_dir() -> PathBuf {
         .join("push-to-talk")
 }
 
+/// Return the conventional generated speaker profile path.
+pub fn default_speaker_profile_path() -> PathBuf {
+    config_dir().join("speaker-profile.md")
+}
+
 /// Load config from disk, falling back to defaults.
 pub fn load() -> Config {
     let dir = config_dir();
@@ -257,14 +262,17 @@ impl Config {
         None
     }
 
-    /// Resolve the speaker profile content, if configured.
+    /// Resolve speaker profile content.
+    ///
+    /// An explicit config path wins. Otherwise, use the generated profile that
+    /// the onboarding flow writes to the config directory.
     pub fn speaker_profile(&self) -> String {
         match &self.transcription.speaker_profile {
             Some(path_str) => {
                 let path = resolve_path(path_str);
                 std::fs::read_to_string(&path).unwrap_or_default()
             }
-            None => String::new(),
+            None => std::fs::read_to_string(default_speaker_profile_path()).unwrap_or_default(),
         }
     }
 
