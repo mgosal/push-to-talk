@@ -14,3 +14,4 @@ config.toml
 !.cargo/config.toml
 speaker-profile.md
 transcripts/
+*.zip
