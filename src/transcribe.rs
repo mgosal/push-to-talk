@@ -237,7 +237,11 @@ pub fn transcribe(
                 .and_then(|v| v["error"]["message"].as_str().map(String::from))
                 .unwrap_or_else(|| resp_text.chars().take(200).collect());
 
-            last_error = format!("API {status}: {msg}");
+            last_error = if status_code == 429 {
+                format!("API quota exceeded — check your account or add credits (429)")
+            } else {
+                format!("API {status}: {msg}")
+            };
 
             if is_retryable_error(&last_error, Some(status_code)) && attempt < max_retries {
                 continue;

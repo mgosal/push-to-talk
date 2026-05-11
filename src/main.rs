@@ -328,18 +328,15 @@ impl AppDelegate {
     }
 
     fn show_onboarding_window(&self, mtm: MainThreadMarker) {
-        // If a live window is already visible, just bring it to front.
-        if let Some(window) = self.ivars().onboarding_window.borrow().as_ref() {
-            if window.isVisible() {
-                window.makeKeyAndOrderFront(None);
-                unsafe {
-                    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
-                }
-                self.update_onboarding_status();
-                return;
+        // Always close any existing window and rebuild from scratch.
+        // Reusing a stored NSWindow reference can cause PAC auth failures on ARM64e
+        // if the window was freed by the system while we weren't looking.
+        {
+            let w = self.ivars().onboarding_window.borrow();
+            if let Some(win) = w.as_ref() {
+                win.close();
             }
         }
-        // Window was closed or never created — drop any stale reference and build a fresh one.
         *self.ivars().onboarding_window.borrow_mut() = None;
         *self.ivars().api_key_field.borrow_mut() = None;
         *self.ivars().provider_popup.borrow_mut() = None;
@@ -1532,7 +1529,9 @@ fn do_transcription(audio_path: &PathBuf) -> TranscribeResult {
         Err(e) => {
             eprintln!("[ptt] Transcription error: {e}");
             db::record(&db, audio_path.to_str(), None, "error", Some(&e), None, None, None);
-            TranscribeResult { text: None, latency: 0.0, error: Some(e), hallucination: false }
+            let path_hint = audio_path.to_str().unwrap_or("unknown path");
+            let msg = format!("{e} — recording saved: {path_hint}");
+            TranscribeResult { text: None, latency: 0.0, error: Some(msg), hallucination: false }
         }
     }
 }
