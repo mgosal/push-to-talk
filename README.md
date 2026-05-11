@@ -16,7 +16,18 @@ The name nods to Wiz Khalifa's "Black and Yellow": "No keys, push to start."
 
 ## Quick start
 
-### 1. Install
+### Option A: Download the app (no build required)
+
+1. Download **[Push-to-Talk-v0.1.0.zip](https://github.com/mgosal/push-to-talk/releases/latest)** from the Releases page
+2. Unzip and drag **Push to Talk.app** to your Applications folder
+3. Launch the app
+
+> **Gatekeeper notice:** The app is ad-hoc signed but not notarized. On first launch, right-click → **Open** to bypass the warning, or run:
+> ```
+> xattr -dr com.apple.quarantine '/Applications/Push to Talk.app'
+> ```
+
+### Option B: Build from source
 
 ```bash
 git clone https://github.com/mgosal/push-to-talk.git
