@@ -14,6 +14,7 @@ pub struct Config {
     pub audio: AudioConfig,
     pub transcription: TranscriptionConfig,
     pub storage: StorageConfig,
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -65,6 +66,14 @@ pub struct StorageConfig {
     pub socket_path: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Show macOS notifications for transcription results and profile events.
+    /// Set to false to suppress all notifications.
+    pub notifications: bool,
+}
+
 // ── Defaults ──────────────────────────────────────────────────────────
 
 impl Default for Config {
@@ -74,6 +83,7 @@ impl Default for Config {
             audio: AudioConfig::default(),
             transcription: TranscriptionConfig::default(),
             storage: StorageConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -116,6 +126,14 @@ impl Default for StorageConfig {
             audio_dir: None,
             pid_file: "/tmp/ptt.pid".into(),
             socket_path: "/tmp/ptt.sock".into(),
+        }
+    }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            notifications: true,
         }
     }
 }
@@ -217,6 +235,23 @@ pub fn save_api_key(provider: Provider, api_key: &str) -> Result<(), String> {
     cfg.api.model = provider.model().into();
     cfg.api.key = None;
     cfg.api.key_file = Some(provider.key_file().into());
+
+    let config_text = toml::to_string_pretty(&cfg)
+        .map_err(|e| format!("failed to serialise config: {e}"))?;
+    std::fs::write(dir.join("config.toml"), config_text)
+        .map_err(|e| format!("failed to write config: {e}"))?;
+
+    Ok(())
+}
+
+/// Save the notifications enabled/disabled setting to config.toml.
+pub fn save_notifications(enabled: bool) -> Result<(), String> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create config directory: {e}"))?;
+
+    let mut cfg = load();
+    cfg.ui.notifications = enabled;
 
     let config_text = toml::to_string_pretty(&cfg)
         .map_err(|e| format!("failed to serialise config: {e}"))?;

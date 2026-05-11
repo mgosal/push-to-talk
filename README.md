@@ -37,10 +37,11 @@ open '/Applications/Push to Talk.app'
 The setup window opens automatically until the required pieces are complete. You can reopen it from the menubar via **Setup…**.
 
 - Choose **OpenRouter** or **OpenAI** and save your API key.
-- Click **Enable Shortcut Access** when you are ready to grant the global right-Option hotkey and paste insertion permission.
+- Click **Enable Shortcut Access** when you are ready to grant the global right-Option hotkey and paste insertion permission. Once approved in System Settings, return to the app — the hotkey activates immediately without a restart.
 - Click **Enable Microphone** when you are ready to grant audio recording permission.
+- Use the **Show notifications** checkbox to enable or disable macOS notifications for transcription results.
 
-The setup window also includes direct buttons for **Accessibility**, **Input Monitoring**, and **Microphone** settings if macOS needs manual approval.
+The setup window also includes direct buttons for **Accessibility** and **Microphone** settings if macOS needs manual approval.
 
 ### 4. Set up your speaker profile
 
@@ -86,6 +87,7 @@ Hold **right Option (⌥)** to record. Release to transcribe and paste at your c
 | 🔴 | Recording |
 | 🔒 | Locked (hands-free) |
 | 🟡 | Transcribing (pulses) |
+| 🟢 | Transcribed successfully (flashes 500ms) |
 
 ### Locked dictation
 
@@ -120,7 +122,7 @@ Learn from Corrections
 ────────────────────────
 3 transcriptions · avg 2.1s
 ────────────────────────
-Quit Dictate               ⌘Q
+Quit Push to Talk          ⌘Q
 ```
 
 ### External control (Stream Deck / scripts)
@@ -253,7 +255,7 @@ API keys are stored locally in `~/.config/push-to-talk/api-key` by default. Dict
 
 Both require Accessibility access. If you rebuilt the app, macOS revokes the permission (the code signature changed).
 
-Fix: open **Setup…** from the menubar and use **Open Accessibility** / **Open Input Monitoring**. If macOS kept an old rebuilt entry, remove it, add the current app, then click **Enable Shortcut Access** again.
+Fix: open **Setup…** from the menubar and use **Open Accessibility**. If macOS kept an old rebuilt entry, remove it, add the current app, then click **Enable Shortcut Access** again — the hotkey activates immediately on return from System Settings.
 
 ### No audio recorded
 

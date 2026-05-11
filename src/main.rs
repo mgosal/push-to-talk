@@ -19,16 +19,16 @@ mod transcribe;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSBezelStyle, NSButton, NSMenu, NSMenuItem, NSPasteboard, NSPopUpButton, NSSecureTextField,
-    NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSWindow,
-    NSWindowStyleMask,
+    NSBezelStyle, NSButton, NSButtonType, NSControlStateValueOff,
+    NSControlStateValueOn, NSMenu, NSMenuItem, NSPasteboard, NSPopUpButton, NSSecureTextField,
+    NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
@@ -54,6 +54,11 @@ struct DelegateIvars {
     api_key_field: RefCell<Option<Retained<NSSecureTextField>>>,
     provider_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     onboarding_status_label: RefCell<Option<Retained<NSTextField>>>,
+    shortcut_btn: RefCell<Option<Retained<NSButton>>>,
+    mic_btn: RefCell<Option<Retained<NSButton>>>,
+    notifications_checkbox: RefCell<Option<Retained<NSButton>>>,
+    /// When set, the menubar icon shows 🟢 until this instant, then reverts to ⚪.
+    success_flash_until: Cell<Option<Instant>>,
     mode: Cell<AppMode>,
     recording: RefCell<Option<audio::NativeRecorder>>,
     recording_path: RefCell<Option<PathBuf>>,
@@ -64,6 +69,9 @@ struct DelegateIvars {
     last_status: RefCell<Option<String>>,
     /// Frame counter for icon pulse animation.
     pulse_frame: Cell<u32>,
+    /// True while a modal panel (e.g. NSOpenPanel) is running on the main thread.
+    /// Guards against re-entrant setup calls and pollTick side-effects during modals.
+    modal_active: Cell<bool>,
 }
 
 // ── App Delegate ──────────────────────────────────────────────────────
@@ -85,9 +93,23 @@ define_class!(
             let cfg = config::load();
             let db = cfg.db_path();
             db::init(&db);
+            notification::set_enabled(cfg.ui.notifications);
             *CONFIG.lock().unwrap() = Some(cfg);
 
             self.setup_menubar(mtm);
+
+            // Auto-request permissions that haven't been decided yet.
+            // Accessibility: prompt immediately so the user sees the system dialog on first launch.
+            if !hotkey::is_accessibility_trusted() {
+                hotkey::request_accessibility();
+            }
+            // Microphone: request in the background if not yet determined.
+            if audio::microphone_permission() == audio::MicrophonePermission::Undetermined {
+                std::thread::Builder::new()
+                    .name("mic-permission-auto".into())
+                    .spawn(|| { let _ = audio::request_microphone_access(); })
+                    .ok();
+            }
 
             self.start_hotkey_monitor_if_allowed();
 
@@ -111,8 +133,24 @@ define_class!(
             eprintln!("[ptt] Ready — hold right Option to dictate");
         }
 
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn did_become_active(&self, _notification: &NSNotification) {
+            // Start hotkey monitor if accessibility was granted since last launch.
+            self.start_hotkey_monitor_if_allowed();
+            let window_visible = self.ivars().onboarding_window.borrow()
+                .as_ref()
+                .map_or(false, |w| w.isVisible());
+            if window_visible {
+                self.update_onboarding_status();
+            }
+        }
+
         #[unsafe(method(pollTick:))]
         fn poll_tick(&self, _timer: &NSTimer) {
+            // Skip all state mutations while a modal panel is blocking the main thread.
+            if self.ivars().modal_active.get() {
+                return;
+            }
             self.process_hotkey_events();
             self.process_ipc_commands();
             self.check_transcription_result();
@@ -121,6 +159,13 @@ define_class!(
             self.check_learn_result();
             self.check_microphone_result();
             self.animate_pulse();
+            // Revert green success flash after 500ms.
+            if let Some(until) = self.ivars().success_flash_until.get() {
+                if Instant::now() >= until {
+                    self.ivars().success_flash_until.set(None);
+                    self.update_icon("⚪");
+                }
+            }
         }
 
         /// Copy the last status/error message to the clipboard.
@@ -197,6 +242,15 @@ define_class!(
             self.open_settings_url("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent");
         }
 
+        #[unsafe(method(toggleNotifications:))]
+        fn toggle_notifications(&self, sender: &NSButton) {
+            let enabled = unsafe { sender.state() } == NSControlStateValueOn;
+            if let Err(e) = config::save_notifications(enabled) {
+                eprintln!("[ptt] Failed to save notifications setting: {e}");
+            }
+            self.reload_config();
+        }
+
         #[unsafe(method(requestMicrophoneAccess:))]
         fn request_microphone_access(&self, _sender: &NSObject) {
             self.request_microphone_access_from_setup();
@@ -232,6 +286,10 @@ impl AppDelegate {
             api_key_field: RefCell::new(None),
             provider_popup: RefCell::new(None),
             onboarding_status_label: RefCell::new(None),
+            shortcut_btn: RefCell::new(None),
+            mic_btn: RefCell::new(None),
+            notifications_checkbox: RefCell::new(None),
+            success_flash_until: Cell::new(None),
             mode: Cell::new(AppMode::Idle),
             recording: RefCell::new(None),
             recording_path: RefCell::new(None),
@@ -240,6 +298,7 @@ impl AppDelegate {
             total_latency: Cell::new(0.0),
             last_status: RefCell::new(None),
             pulse_frame: Cell::new(0),
+            modal_active: Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -247,6 +306,7 @@ impl AppDelegate {
     fn reload_config(&self) {
         let cfg = config::load();
         db::init(&cfg.db_path());
+        notification::set_enabled(cfg.ui.notifications);
         *CONFIG.lock().unwrap() = Some(cfg);
     }
 
@@ -268,16 +328,27 @@ impl AppDelegate {
     }
 
     fn show_onboarding_window(&self, mtm: MainThreadMarker) {
+        // If a live window is already visible, just bring it to front.
         if let Some(window) = self.ivars().onboarding_window.borrow().as_ref() {
-            window.makeKeyAndOrderFront(None);
-            unsafe {
-                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+            if window.isVisible() {
+                window.makeKeyAndOrderFront(None);
+                unsafe {
+                    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+                }
+                self.update_onboarding_status();
+                return;
             }
-            self.update_onboarding_status();
-            return;
         }
+        // Window was closed or never created — drop any stale reference and build a fresh one.
+        *self.ivars().onboarding_window.borrow_mut() = None;
+        *self.ivars().api_key_field.borrow_mut() = None;
+        *self.ivars().provider_popup.borrow_mut() = None;
+        *self.ivars().onboarding_status_label.borrow_mut() = None;
+        *self.ivars().shortcut_btn.borrow_mut() = None;
+        *self.ivars().mic_btn.borrow_mut() = None;
+        *self.ivars().notifications_checkbox.borrow_mut() = None;
 
-        let frame = NSRect::new(NSPoint::new(260.0, 260.0), NSSize::new(560.0, 410.0));
+        let frame = NSRect::new(NSPoint::new(260.0, 260.0), NSSize::new(560.0, 445.0));
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable;
@@ -291,6 +362,7 @@ impl AppDelegate {
             )
         };
         window.setTitle(&NSString::from_str("Push to Talk Setup"));
+        unsafe { window.setReleasedWhenClosed(false); }
 
         let content = window.contentView().unwrap();
         let target: &AnyObject = unsafe { &*(self as *const Self as *const AnyObject) };
@@ -384,18 +456,6 @@ impl AppDelegate {
         );
         content.addSubview(&accessibility_settings);
 
-        let input_settings = Self::button(
-            mtm,
-            "Open Input Monitoring",
-            360.0,
-            166.0,
-            170.0,
-            30.0,
-            target,
-            sel!(openInputMonitoringSettings:),
-        );
-        content.addSubview(&input_settings);
-
         let mic_btn = Self::button(
             mtm,
             "Enable Microphone",
@@ -440,12 +500,29 @@ impl AppDelegate {
         );
         content.addSubview(&help_mic);
 
-        let status = Self::label(mtm, "", 24.0, 26.0, 506.0, 40.0);
+        let status = Self::label(mtm, "", 24.0, 61.0, 506.0, 40.0);
         content.addSubview(&status);
+
+        let notifications_cb = unsafe {
+            NSButton::initWithFrame(
+                mtm.alloc(),
+                NSRect::new(NSPoint::new(24.0, 26.0), NSSize::new(220.0, 30.0)),
+            )
+        };
+        notifications_cb.setTitle(&NSString::from_str("Show notifications"));
+        notifications_cb.setButtonType(NSButtonType::Switch);
+        unsafe {
+            notifications_cb.setTarget(Some(target));
+            notifications_cb.setAction(Some(sel!(toggleNotifications:)));
+        }
+        content.addSubview(&notifications_cb);
 
         *self.ivars().provider_popup.borrow_mut() = Some(provider_popup);
         *self.ivars().api_key_field.borrow_mut() = Some(key_field);
         *self.ivars().onboarding_status_label.borrow_mut() = Some(status);
+        *self.ivars().shortcut_btn.borrow_mut() = Some(shortcut_btn);
+        *self.ivars().mic_btn.borrow_mut() = Some(mic_btn);
+        *self.ivars().notifications_checkbox.borrow_mut() = Some(notifications_cb);
         *self.ivars().onboarding_window.borrow_mut() = Some(window);
 
         self.update_onboarding_status();
@@ -505,17 +582,24 @@ impl AppDelegate {
     }
 
     fn update_onboarding_status(&self) {
-        let key_status = if with_config(|c| c.api_key().is_some()).unwrap_or(false) {
-            "API key saved"
-        } else {
-            "API key missing"
-        };
-        let shortcut_status = if hotkey::is_accessibility_trusted() {
+        let key_exists = with_config(|c| c.api_key().is_some()).unwrap_or(false);
+        let key_status = if key_exists { "API key saved" } else { "API key missing" };
+        if let Some(field) = self.ivars().api_key_field.borrow().as_ref() {
+            let placeholder = if key_exists {
+                "Key saved — paste to replace"
+            } else {
+                "Paste API key"
+            };
+            field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+        }
+        let shortcut_granted = hotkey::is_accessibility_trusted();
+        let shortcut_status = if shortcut_granted {
             "shortcut access granted"
         } else {
             "shortcut access needed"
         };
-        let mic_status = match audio::microphone_permission() {
+        let mic_permission = audio::microphone_permission();
+        let mic_status = match mic_permission {
             audio::MicrophonePermission::Granted => "microphone granted",
             audio::MicrophonePermission::Denied => "microphone denied",
             audio::MicrophonePermission::Undetermined => "microphone access needed",
@@ -523,6 +607,28 @@ impl AppDelegate {
         let text = format!("{key_status} | {shortcut_status} | {mic_status}");
         if let Some(label) = self.ivars().onboarding_status_label.borrow().as_ref() {
             label.setStringValue(&NSString::from_str(&text));
+        }
+        if let Some(btn) = self.ivars().shortcut_btn.borrow().as_ref() {
+            let title = if shortcut_granted { "✓ Shortcut Enabled" } else { "Enable Shortcut Access" };
+            btn.setTitle(&NSString::from_str(title));
+        }
+        if let Some(btn) = self.ivars().mic_btn.borrow().as_ref() {
+            let title = match mic_permission {
+                audio::MicrophonePermission::Granted => "✓ Microphone Enabled",
+                audio::MicrophonePermission::Denied => "Microphone Denied",
+                audio::MicrophonePermission::Undetermined => "Enable Microphone",
+            };
+            btn.setTitle(&NSString::from_str(title));
+        }
+        let notifications_enabled = with_config(|c| c.ui.notifications).unwrap_or(true);
+        if let Some(cb) = self.ivars().notifications_checkbox.borrow().as_ref() {
+            unsafe {
+                cb.setState(if notifications_enabled {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
         }
     }
 
@@ -702,7 +808,7 @@ impl AppDelegate {
         let quit_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc(),
-                &NSString::from_str("Quit Dictate"),
+                &NSString::from_str("Quit Push to Talk"),
                 Some(sel!(terminate:)),
                 &NSString::from_str("q"),
             )
@@ -828,6 +934,15 @@ impl AppDelegate {
         }
     }
 
+    fn update_icon(&self, icon: &str) {
+        let mtm = MainThreadMarker::from(self);
+        if let Some(si) = self.ivars().status_item.get() {
+            if let Some(btn) = si.button(mtm) {
+                btn.setTitle(&NSString::from_str(icon));
+            }
+        }
+    }
+
     fn update_toggle_title(&self, title: &str) {
         if let Some(mi) = self.ivars().toggle_menu_item.get() {
             mi.setTitle(&NSString::from_str(title));
@@ -886,7 +1001,8 @@ impl AppDelegate {
                 self.ivars().total_latency.set(self.ivars().total_latency.get() + result.latency);
                 let avg = self.ivars().total_latency.get() / n as f64;
                 let preview: String = text.chars().take(40).collect();
-                self.update_ui("⚪", &format!("✓ {preview}… ({:.1}s, avg {:.1}s)", result.latency, avg));
+                self.update_ui("🟢", &format!("✓ {preview}… ({:.1}s, avg {:.1}s)", result.latency, avg));
+                self.ivars().success_flash_until.set(Some(Instant::now() + Duration::from_millis(500)));
                 self.update_stats();
 
                 // If calibration is active, feed the transcript to the comparator
@@ -1001,6 +1117,11 @@ impl AppDelegate {
     fn start_onboarding(&self) {
         use objc2_app_kit::NSOpenPanel;
 
+        // Prevent re-entrant calls (e.g. user clicks menu item again while panel is open)
+        if self.ivars().modal_active.get() {
+            return;
+        }
+
         let mtm = MainThreadMarker::from(self);
         self.update_ui("⚪", "Setting up speaker profile…");
 
@@ -1014,7 +1135,9 @@ impl AppDelegate {
         )));
         panel.setPrompt(Some(&NSString::from_str("Use This File")));
 
+        self.ivars().modal_active.set(true);
         let response = unsafe { panel.runModal() };
+        self.ivars().modal_active.set(false);
 
         // NSModalResponseOK = 1
         if response != objc2_app_kit::NSModalResponseOK {
@@ -1046,7 +1169,7 @@ impl AppDelegate {
         };
 
         self.update_ui("🟡", "Generating speaker profile…");
-        notification::notify_success("Generating your speaker profile from the uploaded document…", 0.0);
+        notification::notify("Speaker Profile", "Reading your document and generating a profile — this may take a few seconds…");
 
         let (endpoint, model, api_key) = match with_config(|c| {
             (c.api.endpoint.clone(), c.api.model.clone(), c.api_key())
@@ -1084,8 +1207,9 @@ impl AppDelegate {
                     match calibrate::save_profile(&profile_text) {
                         Ok(path) => {
                             self.update_ui("⚪", "✓ Speaker profile created");
-                            notification::notify_success(
-                                &format!("Profile saved to {}", path.display()), 0.0
+                            notification::notify(
+                                "Speaker Profile Ready",
+                                &format!("Your profile was saved to {}. It has been opened for review.", path.display())
                             );
                             eprintln!("[ptt] Speaker profile saved to {}", path.display());
                             // Open in default editor
@@ -1095,13 +1219,13 @@ impl AppDelegate {
                         }
                         Err(e) => {
                             self.update_ui("⚪", &format!("✗ {e}"));
-                            notification::notify_error(&e);
+                            notification::notify("Speaker Profile Failed", &e);
                         }
                     }
                 }
                 Err(e) => {
                     self.update_ui("⚪", &format!("✗ {e}"));
-                    notification::notify_error(&e);
+                    notification::notify("Speaker Profile Failed", &e);
                 }
             }
         }
