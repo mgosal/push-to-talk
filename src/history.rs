@@ -42,6 +42,9 @@ static HISTORY_WINDOW: Mutex<Ptr> = Mutex::new(Ptr(std::ptr::null_mut()));
 static HISTORY_TABLE: Mutex<Ptr> = Mutex::new(Ptr(std::ptr::null_mut()));
 static HISTORY_TEXT_VIEW: Mutex<Ptr> = Mutex::new(Ptr(std::ptr::null_mut()));
 static HISTORY_STATUS_LABEL: Mutex<Ptr> = Mutex::new(Ptr(std::ptr::null_mut()));
+static HISTORY_RETRY_BTN: Mutex<Ptr> = Mutex::new(Ptr(std::ptr::null_mut()));
+/// Audio path of the currently selected row, if it exists on disk and the row is an error.
+static HISTORY_SELECTED_AUDIO_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 // ── History delegate (data source only) ───────────────────────────────
 // NSTableViewDelegate requires NSControlTextEditingDelegate, which adds
@@ -142,7 +145,7 @@ define_class!(
 
             let idx = selected as usize;
 
-            let (text, status_text) = {
+            let (text, status_text, audio_path) = {
                 let mut data = match HISTORY_DATA.lock().ok() {
                     Some(d) => d,
                     None => return,
@@ -170,8 +173,21 @@ define_class!(
                     if row.corrected.is_some() { " | Corrected" } else { "" },
                 );
 
-                (transcript.to_string(), status)
+                let retryable = row.status == "error"
+                    && row.audio_path.as_ref()
+                        .map(|p| std::path::Path::new(p).exists())
+                        .unwrap_or(false);
+                let audio_path = if retryable { row.audio_path.clone() } else { None };
+
+                (transcript.to_string(), status, audio_path)
             };
+
+            let retryable = audio_path.is_some();
+            *HISTORY_SELECTED_AUDIO_PATH.lock().unwrap() = audio_path;
+            if let Some(ptr) = HISTORY_RETRY_BTN.lock().ok().and_then(|p| p.get()) {
+                let btn: &NSButton = unsafe { &*(ptr as *const NSButton) };
+                btn.setEnabled(retryable);
+            }
 
             // Update text view
             if let Some(ptr) = HISTORY_TEXT_VIEW.lock().ok().and_then(|p| p.get()) {
@@ -184,6 +200,41 @@ define_class!(
                 let label: &NSTextField = unsafe { &*(ptr as *const NSTextField) };
                 label.setStringValue(&NSString::from_str(&status_text));
             }
+        }
+
+        #[unsafe(method(retryTranscription:))]
+        fn retry_transcription(&self, _sender: &NSObject) {
+            let audio_path = HISTORY_SELECTED_AUDIO_PATH.lock().ok()
+                .and_then(|p| p.clone())
+                .map(std::path::PathBuf::from);
+            let audio_path = match audio_path {
+                Some(p) if p.exists() => p,
+                _ => return,
+            };
+
+            // Guard against retrying while another transcription is in flight.
+            if super::TRANSCRIBE_RX.lock().map(|r| r.is_some()).unwrap_or(false) {
+                return;
+            }
+
+            if let Some(ptr) = HISTORY_STATUS_LABEL.lock().ok().and_then(|p| p.get()) {
+                let label: &NSTextField = unsafe { &*(ptr as *const NSTextField) };
+                label.setStringValue(&NSString::from_str("Retrying transcription…"));
+            }
+            if let Some(ptr) = HISTORY_RETRY_BTN.lock().ok().and_then(|p| p.get()) {
+                let btn: &NSButton = unsafe { &*(ptr as *const NSButton) };
+                btn.setEnabled(false);
+            }
+
+            let (tx, rx) = std::sync::mpsc::channel::<super::TranscribeResult>();
+            std::thread::Builder::new()
+                .name("retry-transcribe".into())
+                .spawn(move || {
+                    let result = super::do_transcription(&audio_path);
+                    let _ = tx.send(result);
+                })
+                .ok();
+            *super::TRANSCRIBE_RX.lock().unwrap() = Some(rx);
         }
 
         #[unsafe(method(saveCorrection:))]
@@ -400,7 +451,7 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
     content_view.addSubview(&text_scroll);
 
     // ── Bottom bar: status label + save button ────────────────────
-    let status_frame = NSRect::new(NSPoint::new(10.0, 10.0), NSSize::new(w - 160.0, 22.0));
+    let status_frame = NSRect::new(NSPoint::new(10.0, 10.0), NSSize::new(w - 310.0, 22.0));
     let status_label = unsafe { NSTextField::initWithFrame(mtm.alloc(), status_frame) };
     status_label.setStringValue(&NSString::from_str("Select a dictation above"));
     status_label.setBezeled(false);
@@ -414,6 +465,21 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
         );
     }
     content_view.addSubview(&status_label);
+
+    let retry_frame = NSRect::new(NSPoint::new(w - 295.0, 6.0), NSSize::new(145.0, 28.0));
+    let retry_btn = unsafe { NSButton::initWithFrame(mtm.alloc(), retry_frame) };
+    retry_btn.setTitle(&NSString::from_str("Retry Transcription"));
+    retry_btn.setBezelStyle(NSBezelStyle::Rounded);
+    retry_btn.setEnabled(false);
+    unsafe {
+        retry_btn.setTarget(Some(&delegate));
+        retry_btn.setAction(Some(sel!(retryTranscription:)));
+        retry_btn.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin
+                | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+    }
+    content_view.addSubview(&retry_btn);
 
     let btn_frame = NSRect::new(NSPoint::new(w - 140.0, 6.0), NSSize::new(130.0, 28.0));
     let save_btn = unsafe { NSButton::initWithFrame(mtm.alloc(), btn_frame) };
@@ -435,6 +501,7 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
     *HISTORY_TABLE.lock().unwrap() = Ptr(&*table as *const NSTableView as *mut c_void);
     *HISTORY_TEXT_VIEW.lock().unwrap() = Ptr(&*text_view as *const NSTextView as *mut c_void);
     *HISTORY_STATUS_LABEL.lock().unwrap() = Ptr(&*status_label as *const NSTextField as *mut c_void);
+    *HISTORY_RETRY_BTN.lock().unwrap() = Ptr(&*retry_btn as *const NSButton as *mut c_void);
     *HISTORY_WINDOW.lock().unwrap() = Ptr(&*window as *const NSWindow as *mut c_void);
 
     // Show window
@@ -451,6 +518,7 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
     std::mem::forget(table_scroll);
     std::mem::forget(text_scroll);
     std::mem::forget(status_label);
+    std::mem::forget(retry_btn);
     std::mem::forget(save_btn);
     std::mem::forget(sep_label);
     std::mem::forget(col_status);

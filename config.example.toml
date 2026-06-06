@@ -60,3 +60,8 @@ pid_file = "/tmp/ptt.pid"
 
 # Unix socket for IPC (--toggle, --status). Default: /tmp/ptt.sock
 socket_path = "/tmp/ptt.sock"
+
+[ui]
+# Show macOS notifications for transcription results and profile events.
+# Set to false to suppress all notifications.
+notifications = true
