@@ -174,13 +174,13 @@ Use **Setup…** in the menubar for OpenRouter or OpenAI. It writes `~/.config/p
 ```toml
 [api]
 endpoint = "https://openrouter.ai/api/v1/chat/completions"
-model = "openai/gpt-4o-audio-preview"
+model = "openai/gpt-4o-transcribe"
 ```
 
 ```toml
 [api]
 endpoint = "https://api.openai.com/v1/chat/completions"
-model = "gpt-4o-audio-preview"
+model = "gpt-4o-transcribe"
 ```
 
 Any endpoint that accepts the OpenAI chat completions format with audio input will work.

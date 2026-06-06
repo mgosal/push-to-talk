@@ -69,7 +69,7 @@ pub fn generate_profile(
     background_text: &str,
 ) -> Result<String, String> {
     let body = serde_json::json!({
-        "model": model.replace("audio-preview", "mini"),
+        "model": config::text_model_for(model),
         "messages": [
             {"role": "system", "content": PROFILE_GENERATION_PROMPT},
             {"role": "user", "content": background_text}
@@ -165,7 +165,7 @@ pub fn generate_calibration_sentences(
     profile: &str,
 ) -> Result<Vec<CalibrationSentence>, String> {
     let body = serde_json::json!({
-        "model": model.replace("audio-preview", "mini"),
+        "model": config::text_model_for(model),
         "messages": [
             {"role": "system", "content": CALIBRATION_PROMPT},
             {"role": "user", "content": profile}
@@ -367,7 +367,7 @@ pub fn analyse_corrections(
         + "\nOutput ONLY the new markdown sections to append. No preamble.";
 
     let body = serde_json::json!({
-        "model": model.replace("audio-preview", "mini"),
+        "model": config::text_model_for(model),
         "messages": [
             {"role": "user", "content": prompt}
         ],
@@ -522,7 +522,7 @@ pub fn finalise_calibration(
         + "\nOutput ONLY the markdown section to add to the profile. No preamble.";
 
     let body = serde_json::json!({
-        "model": model.replace("audio-preview", "mini"),
+        "model": config::text_model_for(model),
         "messages": [
             {"role": "user", "content": prompt}
         ],

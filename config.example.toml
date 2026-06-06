@@ -12,9 +12,9 @@
 endpoint = "https://openrouter.ai/api/v1/chat/completions"
 
 # Model identifier. Must support audio input.
-#   OpenRouter: "openai/gpt-4o-audio-preview"
-#   OpenAI:     "gpt-4o-audio-preview"
-model = "openai/gpt-4o-audio-preview"
+#   OpenRouter: "openai/gpt-4o-transcribe"
+#   OpenAI:     "gpt-4o-transcribe"
+model = "openai/gpt-4o-transcribe"
 
 # API key. Three options (checked in order):
 #   1. Inline:       key = "sk-or-..."

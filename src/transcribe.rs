@@ -146,6 +146,38 @@ pub fn transcribe(
     max_retries: u32,
     retry_backoff: &[f64],
 ) -> Result<TranscriptionResult, String> {
+    let model = crate::config::transcription_model(model);
+    if crate::config::uses_transcription_endpoint(&model) {
+        return transcribe_with_audio_endpoint(
+            endpoint,
+            &model,
+            api_key,
+            speaker_profile,
+            audio_path,
+            max_retries,
+            retry_backoff,
+        );
+    }
+    transcribe_with_chat_endpoint(
+        endpoint,
+        &model,
+        api_key,
+        speaker_profile,
+        audio_path,
+        max_retries,
+        retry_backoff,
+    )
+}
+
+fn transcribe_with_chat_endpoint(
+    endpoint: &str,
+    model: &str,
+    api_key: &str,
+    speaker_profile: &str,
+    audio_path: &Path,
+    max_retries: u32,
+    retry_backoff: &[f64],
+) -> Result<TranscriptionResult, String> {
     use base64::Engine;
 
     let start = std::time::Instant::now();
@@ -259,6 +291,107 @@ pub fn transcribe(
     }
 
     Err(last_error)
+}
+
+fn transcribe_with_audio_endpoint(
+    endpoint: &str,
+    model: &str,
+    api_key: &str,
+    speaker_profile: &str,
+    audio_path: &Path,
+    max_retries: u32,
+    retry_backoff: &[f64],
+) -> Result<TranscriptionResult, String> {
+    let start = std::time::Instant::now();
+    let endpoint = crate::config::transcription_endpoint(endpoint);
+    let audio_bytes =
+        std::fs::read(audio_path).map_err(|e| format!("Failed to read audio: {e}"))?;
+    let file_name = audio_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audio.wav")
+        .to_string();
+    let prompt = build_system_prompt(speaker_profile);
+
+    let client = reqwest::blocking::Client::new();
+    let mut last_error = String::new();
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let delay_idx = (attempt as usize - 1).min(retry_backoff.len().saturating_sub(1));
+            let delay = retry_backoff.get(delay_idx).copied().unwrap_or(5.0);
+            eprintln!("[ptt] Retry {attempt}/{max_retries} after {delay:.0}s...");
+            std::thread::sleep(std::time::Duration::from_secs_f64(delay));
+        }
+
+        let file_part = reqwest::blocking::multipart::Part::bytes(audio_bytes.clone())
+            .file_name(file_name.clone());
+        let form = reqwest::blocking::multipart::Form::new()
+            .part("file", file_part)
+            .text("model", model.to_string())
+            .text("prompt", prompt.clone())
+            .text("response_format", "json");
+
+        let resp = match client
+            .post(&endpoint)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .multipart(form)
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = format!("HTTP error: {e}");
+                if is_retryable_error(&last_error, None) && attempt < max_retries {
+                    continue;
+                }
+                return Err(last_error);
+            }
+        };
+
+        let status = resp.status();
+        let status_code = status.as_u16();
+        let resp_text = resp.text().map_err(|e| format!("Response read error: {e}"))?;
+
+        if !status.is_success() {
+            let msg = serde_json::from_str::<serde_json::Value>(&resp_text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| resp_text.chars().take(200).collect());
+
+            last_error = format!("API {status}: {msg}");
+
+            if is_retryable_error(&last_error, Some(status_code)) && attempt < max_retries {
+                continue;
+            }
+            return Err(last_error);
+        }
+
+        let resp_json: serde_json::Value =
+            serde_json::from_str(&resp_text).map_err(|e| format!("JSON parse error: {e}"))?;
+        let text = parse_transcription_text(&resp_json).unwrap_or_default();
+
+        let latency_s = start.elapsed().as_secs_f64();
+        let duration_s = crate::audio::get_duration(audio_path).unwrap_or(0.0);
+        let word_count = text.split_whitespace().count() as f64;
+        let wps = if duration_s > 0.0 { word_count / duration_s } else { 0.0 };
+
+        return Ok(TranscriptionResult {
+            text,
+            latency_s,
+            wps,
+            duration_s,
+        });
+    }
+
+    Err(last_error)
+}
+
+fn parse_transcription_text(resp_json: &serde_json::Value) -> Option<String> {
+    resp_json["text"].as_str().map(|s| s.trim().to_string()).or_else(|| {
+        resp_json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.trim().to_string())
+    })
 }
 
 #[cfg(test)]

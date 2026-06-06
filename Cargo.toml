@@ -34,7 +34,7 @@ core-graphics = "0.24"
 core-foundation = "0.10"
 
 # HTTP client for OpenAI-compatible API
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "multipart"] }
 
 # SQLite for dictation history & corrections
 rusqlite = { version = "0.32", features = ["bundled"] }

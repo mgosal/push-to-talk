@@ -186,8 +186,8 @@ impl Provider {
 
     pub fn model(self) -> &'static str {
         match self {
-            Self::OpenAI => "gpt-4o-audio-preview",
-            Self::OpenRouter => "openai/gpt-4o-audio-preview",
+            Self::OpenAI => "gpt-4o-transcribe",
+            Self::OpenRouter => "openai/gpt-4o-transcribe",
         }
     }
 
@@ -229,6 +229,92 @@ pub fn save_api_key(provider: Provider, api_key: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write config: {e}"))?;
 
     Ok(())
+}
+
+/// Map retired or provider-specific aliases to the model used for audio
+/// transcription requests. This keeps existing config files working after
+/// model deprecations.
+pub fn transcription_model(model: &str) -> String {
+    match model {
+        "gpt-4o-audio-preview" => "gpt-4o-transcribe".into(),
+        "openai/gpt-4o-audio-preview" => "openai/gpt-4o-transcribe".into(),
+        _ => model.into(),
+    }
+}
+
+/// Return the endpoint expected by speech-to-text models.
+pub fn transcription_endpoint(endpoint: &str) -> String {
+    if endpoint.contains("/audio/transcriptions") {
+        endpoint.into()
+    } else {
+        endpoint.replace("/chat/completions", "/audio/transcriptions")
+    }
+}
+
+/// Whether this model should use the speech-to-text transcription endpoint
+/// rather than the chat completions endpoint.
+pub fn uses_transcription_endpoint(model: &str) -> bool {
+    transcription_model(model).contains("transcribe")
+}
+
+/// Pick a text-capable model for profile generation and calibration analysis.
+/// STT-only models are not suitable for plain text chat prompts.
+pub fn text_model_for(model: &str) -> String {
+    match transcription_model(model).as_str() {
+        "gpt-4o-transcribe" | "gpt-4o-mini-transcribe" => "gpt-4o-mini".into(),
+        "openai/gpt-4o-transcribe" | "openai/gpt-4o-mini-transcribe" => {
+            "openai/gpt-4o-mini".into()
+        }
+        normalized => normalized.replace("audio-preview", "mini"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        text_model_for, transcription_endpoint, transcription_model, uses_transcription_endpoint,
+    };
+
+    #[test]
+    fn maps_retired_audio_preview_models() {
+        assert_eq!(
+            transcription_model("gpt-4o-audio-preview"),
+            "gpt-4o-transcribe"
+        );
+        assert_eq!(
+            transcription_model("openai/gpt-4o-audio-preview"),
+            "openai/gpt-4o-transcribe"
+        );
+    }
+
+    #[test]
+    fn maps_transcription_models_to_text_models_for_calibration() {
+        assert_eq!(text_model_for("gpt-4o-transcribe"), "gpt-4o-mini");
+        assert_eq!(
+            text_model_for("openai/gpt-4o-transcribe"),
+            "openai/gpt-4o-mini"
+        );
+        assert_eq!(text_model_for("custom/model"), "custom/model");
+    }
+
+    #[test]
+    fn derives_audio_transcription_endpoints_from_chat_endpoints() {
+        assert_eq!(
+            transcription_endpoint("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            transcription_endpoint("https://openrouter.ai/api/v1/chat/completions"),
+            "https://openrouter.ai/api/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn detects_transcription_endpoint_models() {
+        assert!(uses_transcription_endpoint("gpt-4o-transcribe"));
+        assert!(uses_transcription_endpoint("openai/gpt-4o-audio-preview"));
+        assert!(!uses_transcription_endpoint("gpt-audio"));
+    }
 }
 
 // ── Resolved accessors ───────────────────────────────────────────────
