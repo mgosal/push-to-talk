@@ -6,20 +6,20 @@ use objc2_foundation::NSString;
 /// Backup the current clipboard contents, set new text, paste via Cmd+V,
 /// then restore the original clipboard after a short delay.
 pub fn paste_text(text: &str) {
-    let pb = unsafe { NSPasteboard::generalPasteboard() };
+    let pb = { NSPasteboard::generalPasteboard() };
 
     // Backup current clipboard
-    let backup = unsafe {
+    let backup = {
         pb.stringForType(&NSString::from_str("public.utf8-plain-text"))
     };
 
     // Set clipboard to transcription
-    unsafe {
+    {
         pb.clearContents();
     }
     let ns_text = NSString::from_str(text);
     let text_type = NSString::from_str("public.utf8-plain-text");
-    unsafe {
+    {
         pb.setString_forType(&ns_text, &text_type);
     }
 
@@ -32,7 +32,7 @@ pub fn paste_text(text: &str) {
     // Restore clipboard after paste completes
     std::thread::sleep(std::time::Duration::from_millis(200));
     if let Some(original) = backup {
-        unsafe {
+        {
             pb.clearContents();
             pb.setString_forType(&original, &text_type);
         }

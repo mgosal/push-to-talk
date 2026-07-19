@@ -21,7 +21,7 @@ pub fn is_format_hallucination(text: &str) -> Option<&'static str> {
     }
     // Starts with HTML/XML tag
     if trimmed.starts_with('<')
-        && trimmed.chars().nth(1).map_or(false, |c| c.is_ascii_alphabetic())
+        && trimmed.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic())
     {
         return Some("starts with HTML/XML tag");
     }
@@ -67,9 +67,12 @@ pub fn is_format_hallucination(text: &str) -> Option<&'static str> {
 }
 
 /// WPS-based hallucination check: reject transcripts faster than human speech.
+///
+/// If the duration is unknown (metadata read failed), WPS cannot be computed —
+/// don't discard an otherwise valid transcript; the format check still applies.
 pub fn is_wps_hallucination(text: &str, duration_s: f64, max_wps: f64) -> bool {
     if duration_s <= 0.0 {
-        return true;
+        return false;
     }
     let words = text.split_whitespace().count() as f64;
     words / duration_s > max_wps
@@ -270,7 +273,7 @@ fn transcribe_with_chat_endpoint(
                 .unwrap_or_else(|| resp_text.chars().take(200).collect());
 
             last_error = if status_code == 429 {
-                format!("API quota exceeded — check your account or add credits (429)")
+                "API quota exceeded — check your account or add credits (429)".to_string()
             } else {
                 format!("API {status}: {msg}")
             };

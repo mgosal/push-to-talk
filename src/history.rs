@@ -23,7 +23,6 @@ struct Ptr(*mut c_void);
 unsafe impl Send for Ptr {}
 
 impl Ptr {
-    fn null() -> Self { Ptr(std::ptr::null_mut()) }
     fn get(&self) -> Option<*mut c_void> {
         if self.0.is_null() { None } else { Some(self.0) }
     }
@@ -91,7 +90,7 @@ define_class!(
             }
 
             let row_data = &data.rows[idx];
-            let col_id = unsafe { column.identifier() };
+            let col_id = { column.identifier() };
             let col_str = col_id.to_string();
 
             let text = match col_str.as_str() {
@@ -192,7 +191,7 @@ define_class!(
             // Update text view
             if let Some(ptr) = HISTORY_TEXT_VIEW.lock().ok().and_then(|p| p.get()) {
                 let text_view: &NSTextView = unsafe { &*(ptr as *const NSTextView) };
-                unsafe { text_view.setString(&NSString::from_str(&text)); }
+                { text_view.setString(&NSString::from_str(&text)); }
             }
 
             // Update status label
@@ -245,7 +244,7 @@ define_class!(
                 .and_then(|p| p.get())
                 .map(|ptr| {
                     let text_view: &NSTextView = unsafe { &*(ptr as *const NSTextView) };
-                    unsafe { text_view.string().to_string() }
+                    text_view.string().to_string()
                 });
 
             let corrected_text = match corrected_text {
@@ -304,8 +303,8 @@ pub fn show(mtm: MainThreadMarker, db_path: &std::path::Path) {
         if let Some(ptr) = guard.get() {
             let window: &NSWindow = unsafe { &*(ptr as *const NSWindow) };
             window.makeKeyAndOrderFront(None);
-            unsafe {
-                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+            {
+                NSApplication::sharedApplication(mtm).activate();
             }
             reload_data(db_path);
             if let Some(ptr) = HISTORY_TABLE.lock().ok().and_then(|p| p.get()) {
@@ -358,33 +357,33 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
     let h = content_bounds.size.height;
 
     // ── Table columns ─────────────────────────────────────────────
-    let col_status = unsafe {
+    let col_status = {
         NSTableColumn::initWithIdentifier(mtm.alloc(), &NSString::from_str("status"))
     };
     col_status.setWidth(30.0);
-    unsafe { col_status.headerCell().setStringValue(&NSString::from_str("⚑")); }
+    { col_status.headerCell().setStringValue(&NSString::from_str("⚑")); }
 
-    let col_time = unsafe {
+    let col_time = {
         NSTableColumn::initWithIdentifier(mtm.alloc(), &NSString::from_str("time"))
     };
     col_time.setWidth(140.0);
-    unsafe { col_time.headerCell().setStringValue(&NSString::from_str("Time")); }
+    { col_time.headerCell().setStringValue(&NSString::from_str("Time")); }
 
-    let col_latency = unsafe {
+    let col_latency = {
         NSTableColumn::initWithIdentifier(mtm.alloc(), &NSString::from_str("latency"))
     };
     col_latency.setWidth(60.0);
-    unsafe { col_latency.headerCell().setStringValue(&NSString::from_str("Latency")); }
+    { col_latency.headerCell().setStringValue(&NSString::from_str("Latency")); }
 
-    let col_transcript = unsafe {
+    let col_transcript = {
         NSTableColumn::initWithIdentifier(mtm.alloc(), &NSString::from_str("transcript"))
     };
     col_transcript.setWidth(w - 250.0);
-    unsafe { col_transcript.headerCell().setStringValue(&NSString::from_str("Transcript")); }
+    { col_transcript.headerCell().setStringValue(&NSString::from_str("Transcript")); }
 
     // ── Table view ────────────────────────────────────────────────
     let table_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h * 0.45));
-    let table = unsafe { NSTableView::initWithFrame(mtm.alloc(), table_frame) };
+    let table = { NSTableView::initWithFrame(mtm.alloc(), table_frame) };
 
     table.addTableColumn(&col_status);
     table.addTableColumn(&col_time);
@@ -400,10 +399,10 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
 
     // Scroll view for table (top half)
     let scroll_frame = NSRect::new(NSPoint::new(0.0, h * 0.55), NSSize::new(w, h * 0.45));
-    let table_scroll = unsafe { NSScrollView::initWithFrame(mtm.alloc(), scroll_frame) };
+    let table_scroll = { NSScrollView::initWithFrame(mtm.alloc(), scroll_frame) };
     table_scroll.setDocumentView(Some(&table));
     table_scroll.setHasVerticalScroller(true);
-    unsafe {
+    {
         table_scroll.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
@@ -413,13 +412,13 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
 
     // ── Separator label ───────────────────────────────────────────
     let sep_frame = NSRect::new(NSPoint::new(10.0, h * 0.52), NSSize::new(w - 20.0, 20.0));
-    let sep_label = unsafe { NSTextField::initWithFrame(mtm.alloc(), sep_frame) };
+    let sep_label = { NSTextField::initWithFrame(mtm.alloc(), sep_frame) };
     sep_label.setStringValue(&NSString::from_str("Select a dictation to view or correct:"));
     sep_label.setBezeled(false);
     sep_label.setDrawsBackground(false);
     sep_label.setEditable(false);
     sep_label.setSelectable(false);
-    unsafe {
+    {
         sep_label.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewMinYMargin,
@@ -429,7 +428,7 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
 
     // ── Text view (bottom half) ───────────────────────────────────
     let text_frame = NSRect::new(NSPoint::new(0.0, 40.0), NSSize::new(w, h * 0.50 - 40.0));
-    let text_view = unsafe { NSTextView::initWithFrame(mtm.alloc(), text_frame) };
+    let text_view = { NSTextView::initWithFrame(mtm.alloc(), text_frame) };
     text_view.setEditable(true);
     text_view.setRichText(false);
     unsafe {
@@ -439,10 +438,10 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
         )));
     }
 
-    let text_scroll = unsafe { NSScrollView::initWithFrame(mtm.alloc(), text_frame) };
+    let text_scroll = { NSScrollView::initWithFrame(mtm.alloc(), text_frame) };
     text_scroll.setDocumentView(Some(&text_view));
     text_scroll.setHasVerticalScroller(true);
-    unsafe {
+    {
         text_scroll.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
@@ -452,13 +451,13 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
 
     // ── Bottom bar: status label + save button ────────────────────
     let status_frame = NSRect::new(NSPoint::new(10.0, 10.0), NSSize::new(w - 310.0, 22.0));
-    let status_label = unsafe { NSTextField::initWithFrame(mtm.alloc(), status_frame) };
+    let status_label = { NSTextField::initWithFrame(mtm.alloc(), status_frame) };
     status_label.setStringValue(&NSString::from_str("Select a dictation above"));
     status_label.setBezeled(false);
     status_label.setDrawsBackground(false);
     status_label.setEditable(false);
     status_label.setSelectable(false);
-    unsafe {
+    {
         status_label.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewMaxYMargin,
@@ -467,9 +466,9 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
     content_view.addSubview(&status_label);
 
     let retry_frame = NSRect::new(NSPoint::new(w - 295.0, 6.0), NSSize::new(145.0, 28.0));
-    let retry_btn = unsafe { NSButton::initWithFrame(mtm.alloc(), retry_frame) };
+    let retry_btn = { NSButton::initWithFrame(mtm.alloc(), retry_frame) };
     retry_btn.setTitle(&NSString::from_str("Retry Transcription"));
-    retry_btn.setBezelStyle(NSBezelStyle::Rounded);
+    retry_btn.setBezelStyle(NSBezelStyle::Push);
     retry_btn.setEnabled(false);
     unsafe {
         retry_btn.setTarget(Some(&delegate));
@@ -482,14 +481,14 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
     content_view.addSubview(&retry_btn);
 
     let btn_frame = NSRect::new(NSPoint::new(w - 140.0, 6.0), NSSize::new(130.0, 28.0));
-    let save_btn = unsafe { NSButton::initWithFrame(mtm.alloc(), btn_frame) };
+    let save_btn = { NSButton::initWithFrame(mtm.alloc(), btn_frame) };
     save_btn.setTitle(&NSString::from_str("Save Correction"));
-    save_btn.setBezelStyle(NSBezelStyle::Rounded);
+    save_btn.setBezelStyle(NSBezelStyle::Push);
     unsafe {
         save_btn.setTarget(Some(&delegate));
         save_btn.setAction(Some(sel!(saveCorrection:)));
     }
-    unsafe {
+    {
         save_btn.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewMinXMargin
                 | NSAutoresizingMaskOptions::ViewMaxYMargin,
@@ -506,8 +505,8 @@ fn create_window(mtm: MainThreadMarker, db_path: &std::path::Path) {
 
     // Show window
     window.makeKeyAndOrderFront(None);
-    unsafe {
-        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    {
+        NSApplication::sharedApplication(mtm).activate();
     }
 
     // Leak objects — they live for the app lifetime

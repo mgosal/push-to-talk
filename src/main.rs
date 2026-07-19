@@ -17,7 +17,7 @@ mod transcript;
 mod transcribe;
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -139,7 +139,7 @@ define_class!(
             self.start_hotkey_monitor_if_allowed();
             let window_visible = self.ivars().onboarding_window.borrow()
                 .as_ref()
-                .map_or(false, |w| w.isVisible());
+                .is_some_and(|w| w.isVisible());
             if window_visible {
                 self.update_onboarding_status();
             }
@@ -153,17 +153,21 @@ define_class!(
             }
             self.process_hotkey_events();
             self.process_ipc_commands();
+            self.publish_ipc_status();
             self.check_transcription_result();
             self.check_onboarding_result();
             self.check_calibration_gen_result();
             self.check_learn_result();
             self.check_microphone_result();
             self.animate_pulse();
-            // Revert green success flash after 500ms.
+            // Revert green success flash after 500ms — unless a new recording
+            // already started, in which case the icon reflects that state.
             if let Some(until) = self.ivars().success_flash_until.get() {
                 if Instant::now() >= until {
                     self.ivars().success_flash_until.set(None);
-                    self.update_icon("⚪");
+                    if self.ivars().mode.get() == AppMode::Idle {
+                        self.update_icon("⚪");
+                    }
                 }
             }
         }
@@ -176,7 +180,7 @@ define_class!(
                 pb.clearContents();
                 let text_type = NSString::from_str("public.utf8-plain-text");
                 pb.setString_forType(&NSString::from_str(text), &text_type);
-                eprintln!("[ptt] Copied to clipboard: {}", &text[..text.len().min(80)]);
+                eprintln!("[ptt] Copied to clipboard: {}", truncate_chars(text, 80));
             }
         }
 
@@ -244,7 +248,7 @@ define_class!(
 
         #[unsafe(method(toggleNotifications:))]
         fn toggle_notifications(&self, sender: &NSButton) {
-            let enabled = unsafe { sender.state() } == NSControlStateValueOn;
+            let enabled = { sender.state() } == NSControlStateValueOn;
             if let Err(e) = config::save_notifications(enabled) {
                 eprintln!("[ptt] Failed to save notifications setting: {e}");
             }
@@ -268,7 +272,16 @@ use std::sync::LazyLock;
 static CONFIG: LazyLock<Mutex<Option<config::Config>>> = LazyLock::new(|| Mutex::new(None));
 
 fn with_config<T>(f: impl FnOnce(&config::Config) -> T) -> Option<T> {
-    CONFIG.lock().ok().and_then(|c| c.as_ref().map(|cfg| f(cfg)))
+    CONFIG.lock().ok().and_then(|c| c.as_ref().map(f))
+}
+
+/// Truncate to at most `max_chars` characters without splitting a UTF-8
+/// character (byte slicing would panic on multi-byte chars like ✓ or emoji).
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
 }
 
 impl AppDelegate {
@@ -384,7 +397,7 @@ impl AppDelegate {
         );
         content.addSubview(&api_label);
 
-        let provider_popup = unsafe {
+        let provider_popup = {
             NSPopUpButton::initWithFrame_pullsDown(
                 mtm.alloc(),
                 NSRect::new(NSPoint::new(210.0, 318.0), NSSize::new(300.0, 26.0)),
@@ -398,7 +411,7 @@ impl AppDelegate {
         }
         content.addSubview(&provider_popup);
 
-        let key_field = unsafe {
+        let key_field = {
             NSSecureTextField::initWithFrame(
                 mtm.alloc(),
                 NSRect::new(NSPoint::new(210.0, 284.0), NSSize::new(300.0, 26.0)),
@@ -500,7 +513,7 @@ impl AppDelegate {
         let status = Self::label(mtm, "", 24.0, 61.0, 506.0, 40.0);
         content.addSubview(&status);
 
-        let notifications_cb = unsafe {
+        let notifications_cb = {
             NSButton::initWithFrame(
                 mtm.alloc(),
                 NSRect::new(NSPoint::new(24.0, 26.0), NSSize::new(220.0, 30.0)),
@@ -525,8 +538,8 @@ impl AppDelegate {
         self.update_onboarding_status();
         if let Some(window) = self.ivars().onboarding_window.borrow().as_ref() {
             window.makeKeyAndOrderFront(None);
-            unsafe {
-                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+            {
+                NSApplication::sharedApplication(mtm).activate();
             }
         }
     }
@@ -539,7 +552,7 @@ impl AppDelegate {
         w: f64,
         h: f64,
     ) -> Retained<NSTextField> {
-        let label = unsafe {
+        let label = {
             NSTextField::initWithFrame(
                 mtm.alloc(),
                 NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)),
@@ -553,6 +566,7 @@ impl AppDelegate {
         label
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn button(
         mtm: MainThreadMarker,
         title: &str,
@@ -563,14 +577,14 @@ impl AppDelegate {
         target: &AnyObject,
         action: objc2::runtime::Sel,
     ) -> Retained<NSButton> {
-        let button = unsafe {
+        let button = {
             NSButton::initWithFrame(
                 mtm.alloc(),
                 NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)),
             )
         };
         button.setTitle(&NSString::from_str(title));
-        button.setBezelStyle(NSBezelStyle::Rounded);
+        button.setBezelStyle(NSBezelStyle::Push);
         unsafe {
             button.setTarget(Some(target));
             button.setAction(Some(action));
@@ -619,7 +633,7 @@ impl AppDelegate {
         }
         let notifications_enabled = with_config(|c| c.ui.notifications).unwrap_or(true);
         if let Some(cb) = self.ivars().notifications_checkbox.borrow().as_ref() {
-            unsafe {
+            {
                 cb.setState(if notifications_enabled {
                     NSControlStateValueOn
                 } else {
@@ -899,11 +913,31 @@ impl AppDelegate {
                         AppMode::Transcribing => {}
                     }
                 }
-                ipc::IpcCommand::Status => {
-                    // Status is returned inline by the IPC server thread
-                    // for now — the main thread just processes toggle commands
-                }
             }
+        }
+    }
+
+    /// Publish the current app state so the IPC server thread can answer
+    /// `--status` queries without a main-thread round trip.
+    fn publish_ipc_status(&self) {
+        let ipc = match self.ivars().ipc_state.get() {
+            Some(i) => i,
+            None => return,
+        };
+        let mode = self.ivars().mode.get();
+        let state = match mode {
+            AppMode::Idle => "idle",
+            AppMode::Recording => "recording",
+            AppMode::Locked => "locked",
+            AppMode::Transcribing => "transcribing",
+        };
+        if let Ok(mut s) = ipc.lock() {
+            s.status = ipc::StatusSnapshot {
+                state: state.into(),
+                transcriptions: self.ivars().transcription_count.get(),
+                total_latency: self.ivars().total_latency.get(),
+                recording: matches!(mode, AppMode::Recording | AppMode::Locked),
+            };
         }
     }
 
@@ -916,8 +950,8 @@ impl AppDelegate {
         }
         if let Some(mi) = self.ivars().status_menu_item.get() {
             // Truncate for menu display, store full text for copy
-            let display = if status.len() > 60 {
-                format!("{}… (click to copy)", &status[..57])
+            let display = if status.chars().count() > 60 {
+                format!("{}… (click to copy)", truncate_chars(status, 57))
             } else {
                 status.to_string()
             };
@@ -970,11 +1004,11 @@ impl AppDelegate {
         self.ivars().pulse_frame.set(frame);
 
         // Toggle every 5 ticks (500ms at 100ms poll interval)
-        if frame % 5 == 0 {
+        if frame.is_multiple_of(5) {
             let mtm = MainThreadMarker::from(self);
             if let Some(si) = self.ivars().status_item.get() {
                 if let Some(btn) = si.button(mtm) {
-                    let icon = if (frame / 5) % 2 == 0 { "🟡" } else { "⚪" };
+                    let icon = if (frame / 5).is_multiple_of(2) { "🟡" } else { "⚪" };
                     btn.setTitle(&NSString::from_str(icon));
                 }
             }
@@ -1133,7 +1167,7 @@ impl AppDelegate {
         panel.setPrompt(Some(&NSString::from_str("Use This File")));
 
         self.ivars().modal_active.set(true);
-        let response = unsafe { panel.runModal() };
+        let response = { panel.runModal() };
         self.ivars().modal_active.set(false);
 
         // NSModalResponseOK = 1
@@ -1428,20 +1462,19 @@ impl AppDelegate {
 }
 
 // ── Transcription pipeline ────────────────────────────────────────────
-static TRANSCRIBE_RX: LazyLock<Mutex<Option<std::sync::mpsc::Receiver<TranscribeResult>>>> =
+/// Slot for a receiver of a background-thread result, polled by the main thread.
+type ResultSlot<T> = LazyLock<Mutex<Option<std::sync::mpsc::Receiver<T>>>>;
+
+static TRANSCRIBE_RX: ResultSlot<TranscribeResult> = LazyLock::new(|| Mutex::new(None));
+
+static ONBOARDING_RX: ResultSlot<Result<String, String>> = LazyLock::new(|| Mutex::new(None));
+
+static CALIBRATE_GEN_RX: ResultSlot<Result<Vec<calibrate::CalibrationSentence>, String>> =
     LazyLock::new(|| Mutex::new(None));
 
-static ONBOARDING_RX: LazyLock<Mutex<Option<std::sync::mpsc::Receiver<Result<String, String>>>>> =
-    LazyLock::new(|| Mutex::new(None));
+static LEARN_RX: ResultSlot<Result<String, String>> = LazyLock::new(|| Mutex::new(None));
 
-static CALIBRATE_GEN_RX: LazyLock<Mutex<Option<std::sync::mpsc::Receiver<Result<Vec<calibrate::CalibrationSentence>, String>>>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-static LEARN_RX: LazyLock<Mutex<Option<std::sync::mpsc::Receiver<Result<String, String>>>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-static MIC_RX: LazyLock<Mutex<Option<std::sync::mpsc::Receiver<Result<(), String>>>>> =
-    LazyLock::new(|| Mutex::new(None));
+static MIC_RX: ResultSlot<Result<(), String>> = LazyLock::new(|| Mutex::new(None));
 
 struct TranscribeResult {
     text: Option<String>,
@@ -1450,7 +1483,7 @@ struct TranscribeResult {
     hallucination: bool,
 }
 
-fn do_transcription(audio_path: &PathBuf) -> TranscribeResult {
+fn do_transcription(audio_path: &Path) -> TranscribeResult {
     let (endpoint, model, api_key, profile, max_wps, db, max_retries, retry_backoff, transcripts_dir) =
         match with_config(|c| {
             (
@@ -1541,8 +1574,9 @@ fn main() {
     // Parse CLI arguments before anything else
     match ipc::parse_args() {
         ipc::CliAction::Toggle => {
-            let socket_path = config::load().socket_path();
-            let pid_path = config::load().pid_path();
+            let cfg = config::load();
+            let socket_path = cfg.socket_path();
+            let pid_path = cfg.pid_path();
             if !ipc::is_running(&pid_path) {
                 eprintln!("push-to-talk is not running");
                 std::process::exit(1);
@@ -1559,8 +1593,9 @@ fn main() {
             }
         }
         ipc::CliAction::Status => {
-            let socket_path = config::load().socket_path();
-            let pid_path = config::load().pid_path();
+            let cfg = config::load();
+            let socket_path = cfg.socket_path();
+            let pid_path = cfg.pid_path();
             if !ipc::is_running(&pid_path) {
                 println!("{{\"state\": \"not_running\"}}");
                 std::process::exit(0);
@@ -1600,4 +1635,19 @@ fn main() {
 
     eprintln!("[ptt] Config dir: {}", cfg_dir.display());
     app.run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn truncates_on_char_boundaries() {
+        // "✓" is 3 bytes; byte slicing at 2 would panic.
+        let s = "✓✓✓✓";
+        assert_eq!(truncate_chars(s, 2), "✓✓");
+        assert_eq!(truncate_chars(s, 10), s);
+        assert_eq!(truncate_chars("", 5), "");
+        assert_eq!(truncate_chars("plain ascii", 5), "plain");
+    }
 }

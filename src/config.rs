@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 /// Top-level configuration.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub api: ApiConfig,
     pub audio: AudioConfig,
@@ -76,17 +77,6 @@ pub struct UiConfig {
 
 // ── Defaults ──────────────────────────────────────────────────────────
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            api: ApiConfig::default(),
-            audio: AudioConfig::default(),
-            transcription: TranscriptionConfig::default(),
-            storage: StorageConfig::default(),
-            ui: UiConfig::default(),
-        }
-    }
-}
 
 impl Default for ApiConfig {
     fn default() -> Self {
@@ -287,54 +277,6 @@ pub fn text_model_for(model: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        text_model_for, transcription_endpoint, transcription_model, uses_transcription_endpoint,
-    };
-
-    #[test]
-    fn maps_retired_audio_preview_models() {
-        assert_eq!(
-            transcription_model("gpt-4o-audio-preview"),
-            "gpt-4o-transcribe"
-        );
-        assert_eq!(
-            transcription_model("openai/gpt-4o-audio-preview"),
-            "openai/gpt-4o-transcribe"
-        );
-    }
-
-    #[test]
-    fn maps_transcription_models_to_text_models_for_calibration() {
-        assert_eq!(text_model_for("gpt-4o-transcribe"), "gpt-4o-mini");
-        assert_eq!(
-            text_model_for("openai/gpt-4o-transcribe"),
-            "openai/gpt-4o-mini"
-        );
-        assert_eq!(text_model_for("custom/model"), "custom/model");
-    }
-
-    #[test]
-    fn derives_audio_transcription_endpoints_from_chat_endpoints() {
-        assert_eq!(
-            transcription_endpoint("https://api.openai.com/v1/chat/completions"),
-            "https://api.openai.com/v1/audio/transcriptions"
-        );
-        assert_eq!(
-            transcription_endpoint("https://openrouter.ai/api/v1/chat/completions"),
-            "https://openrouter.ai/api/v1/audio/transcriptions"
-        );
-    }
-
-    #[test]
-    fn detects_transcription_endpoint_models() {
-        assert!(uses_transcription_endpoint("gpt-4o-transcribe"));
-        assert!(uses_transcription_endpoint("openai/gpt-4o-audio-preview"));
-        assert!(!uses_transcription_endpoint("gpt-audio"));
-    }
-}
-
 /// Save the notifications enabled/disabled setting to config.toml.
 pub fn save_notifications(enabled: bool) -> Result<(), String> {
     let dir = config_dir();
@@ -440,9 +382,12 @@ impl Config {
 
 /// Resolve a path string: expand `~`, resolve relative to config dir.
 fn resolve_path(p: &str) -> PathBuf {
-    if p.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&p[2..]); // skip "~/"
+    if let Some(home) = dirs::home_dir() {
+        if p == "~" {
+            return home;
+        }
+        if let Some(rest) = p.strip_prefix("~/") {
+            return home.join(rest);
         }
     }
     let path = Path::new(p);
@@ -450,5 +395,53 @@ fn resolve_path(p: &str) -> PathBuf {
         path.to_path_buf()
     } else {
         config_dir().join(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        text_model_for, transcription_endpoint, transcription_model, uses_transcription_endpoint,
+    };
+
+    #[test]
+    fn maps_retired_audio_preview_models() {
+        assert_eq!(
+            transcription_model("gpt-4o-audio-preview"),
+            "gpt-4o-transcribe"
+        );
+        assert_eq!(
+            transcription_model("openai/gpt-4o-audio-preview"),
+            "openai/gpt-4o-transcribe"
+        );
+    }
+
+    #[test]
+    fn maps_transcription_models_to_text_models_for_calibration() {
+        assert_eq!(text_model_for("gpt-4o-transcribe"), "gpt-4o-mini");
+        assert_eq!(
+            text_model_for("openai/gpt-4o-transcribe"),
+            "openai/gpt-4o-mini"
+        );
+        assert_eq!(text_model_for("custom/model"), "custom/model");
+    }
+
+    #[test]
+    fn derives_audio_transcription_endpoints_from_chat_endpoints() {
+        assert_eq!(
+            transcription_endpoint("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            transcription_endpoint("https://openrouter.ai/api/v1/chat/completions"),
+            "https://openrouter.ai/api/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn detects_transcription_endpoint_models() {
+        assert!(uses_transcription_endpoint("gpt-4o-transcribe"));
+        assert!(uses_transcription_endpoint("openai/gpt-4o-audio-preview"));
+        assert!(!uses_transcription_endpoint("gpt-audio"));
     }
 }

@@ -446,10 +446,6 @@ impl CalibrationState {
         self.current_index < self.sentences.len()
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.current_index >= self.sentences.len()
-    }
-
     pub fn progress_text(&self) -> String {
         format!(
             "Sentence {}/{}: {}",

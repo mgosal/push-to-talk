@@ -12,17 +12,33 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcCommand {
     Toggle,
-    Status,
+}
+
+/// Snapshot of app state published by the main thread so the IPC server can
+/// answer `status` queries directly, without a main-thread round trip.
+#[derive(Debug, Clone, Default)]
+pub struct StatusSnapshot {
+    pub state: String,
+    pub transcriptions: u32,
+    pub total_latency: f64,
+    pub recording: bool,
 }
 
 /// IPC messages queued for the main thread.
 pub struct IpcState {
     pub commands: Vec<IpcCommand>,
+    pub status: StatusSnapshot,
 }
 
 impl IpcState {
     pub fn new() -> Self {
-        Self { commands: Vec::new() }
+        Self {
+            commands: Vec::new(),
+            status: StatusSnapshot {
+                state: "idle".into(),
+                ..StatusSnapshot::default()
+            },
+        }
     }
 
     pub fn drain_commands(&mut self) -> Vec<IpcCommand> {
@@ -178,22 +194,18 @@ pub fn start_server(socket_path: &Path) -> Arc<Mutex<IpcState>> {
                                     let _ = stream.write_all(b"ok\n");
                                 }
                                 "status" => {
-                                    // Status is handled synchronously — the main
-                                    // thread will queue the response via a separate
-                                    // mechanism. For simplicity, we push the command
-                                    // and respond with a placeholder. In practice,
-                                    // the main thread polls and responds.
-                                    if let Ok(mut s) = state_clone.lock() {
-                                        s.commands.push(IpcCommand::Status);
-                                    }
-                                    // Give main thread a moment to populate response
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
-                                    // Read back the response that main thread set
+                                    // Answer from the snapshot the main thread
+                                    // publishes on every poll tick.
                                     let resp = if let Ok(s) = state_clone.lock() {
-                                        // Check if there's a status response pending
-                                        // For now, just echo a basic acknowledgment
-                                        drop(s);
-                                        "ok\n".to_string()
+                                        let st = &s.status;
+                                        let mut json = format_status_json(
+                                            &st.state,
+                                            st.transcriptions,
+                                            st.total_latency,
+                                            st.recording,
+                                        );
+                                        json.push('\n');
+                                        json
                                     } else {
                                         "error\n".to_string()
                                     };

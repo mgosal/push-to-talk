@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 /// Save a transcript to a markdown file with YAML frontmatter.
 ///
 /// Returns the path of the saved file, or None if saving failed.
+#[allow(clippy::too_many_arguments)]
 pub fn save(
     transcripts_dir: &Path,
     audio_path: &Path,
