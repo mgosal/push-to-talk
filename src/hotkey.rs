@@ -14,6 +14,9 @@ pub enum HotkeyEvent {
     /// Left arrow pressed while right Option is held.
     /// Main thread decides whether to engage locked mode based on app state.
     LeftArrowDown,
+    /// Escape pressed (any time). Main thread uses this to exit locked mode
+    /// without discarding the transcript.
+    EscapePressed,
 }
 
 /// Shared state between event tap callback and app.
@@ -159,6 +162,7 @@ const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 
 // Key codes
 const LEFT_ARROW_KEYCODE: i64 = 123;
+const ESCAPE_KEYCODE: i64 = 53;
 
 // Right Option key flag (NX_DEVICERALTKEYMASK)
 const NX_DEVICERALTKEYMASK: u64 = 0x40;
@@ -204,6 +208,11 @@ extern "C" fn event_callback(
                             eprintln!("[ptt] ⇠ Left arrow (opt held)");
                         }
                     }
+                }
+            } else if keycode == ESCAPE_KEYCODE {
+                if let Ok(mut s) = state.lock() {
+                    s.events.push(HotkeyEvent::EscapePressed);
+                    eprintln!("[ptt] ⎋ Escape pressed");
                 }
             }
         }

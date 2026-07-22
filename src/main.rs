@@ -885,9 +885,16 @@ impl AppDelegate {
                         // Enter locked mode
                         self.ivars().mode.set(AppMode::Locked);
                         audio::play_tone(audio::Tone::Lock);
-                        self.update_ui("🔒", "🔒 Locked — press right ⌥ to stop");
+                        self.update_ui("🔒", "🔒 Locked — press right ⌥ or Esc to stop");
                         self.update_toggle_title("Stop Recording (locked)");
                         eprintln!("[ptt] Locked dictation mode engaged");
+                    }
+                }
+                hotkey::HotkeyEvent::EscapePressed => {
+                    let mode = self.ivars().mode.get();
+                    if mode == AppMode::Locked {
+                        eprintln!("[ptt] Escape in locked mode — stopping");
+                        self.on_push_up();
                     }
                 }
             }
