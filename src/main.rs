@@ -13,6 +13,7 @@ mod hotkey;
 mod ipc;
 mod notification;
 mod paste;
+mod session;
 mod transcript;
 mod transcribe;
 
@@ -1547,6 +1548,7 @@ fn do_transcription(audio_path: &Path) -> TranscribeResult {
             }
 
             paste::paste_text(&result.text);
+            session::log_voice(&result.text, result.duration_s, result.latency_s, result.wps);
 
             db::record(
                 &db, audio_path.to_str(), Some(&result.text), "success",
