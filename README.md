@@ -18,7 +18,7 @@ The name nods to Wiz Khalifa's "Black and Yellow": "No keys, push to start."
 
 ### Option A: Download the app (no build required)
 
-1. Download **[Push-to-Talk-v0.1.0.zip](https://github.com/mgosal/push-to-talk/releases/latest)** from the Releases page
+1. Download the latest zip from the **[Releases page](https://github.com/mgosal/push-to-talk/releases/latest)**
 2. Unzip and drag **Push to Talk.app** to your Applications folder
 3. Launch the app
 
@@ -58,6 +58,8 @@ The setup window also includes direct buttons for **Accessibility** and **Microp
 
 The speaker profile teaches the transcription model your accent, vocabulary, and domain terms. This is what makes the tool accurate for *you*.
 
+> **Token cost:** The profile is sent as part of the system prompt on every transcription. Keep it compact — proper nouns, pronunciation hints, and a one-line accent/language note. Aim for under 100 tokens. Verbose profiles work but cost more per dictation.
+
 **Option A: Automated wizard** (recommended)
 
 Click **"Set Up Speaker Profile…"** in the menubar menu. Select a text file containing vocabulary, project names, writing preferences, and any reusable personal context you want the dictation model to remember. The app calls the LLM to generate a compact personalised profile, saves it to `~/.config/push-to-talk/speaker-profile.md`, and opens it in your editor for review.
@@ -90,6 +92,8 @@ As you use the app, correct mistakes in the **History & Corrections** window. Ov
 
 A ⚪ icon appears in the menubar.
 
+> **Tip:** If the icon is hidden behind the notch or other menu bar icons, **⌘-drag** it to reorder. Drag it leftward so it stays visible on smaller screens.
+
 ### Push-to-talk
 
 Hold **right Option (⌥)** to record. Release to transcribe and paste at your cursor.
@@ -109,7 +113,7 @@ For longer dictation without holding a key:
 1. Hold **right Option** (starts recording)
 2. Press **left arrow** while holding right Option (engages lock)
 3. Release everything — recording continues hands-free
-4. Press **right Option** again to stop and transcribe
+4. Press **right Option** or **Escape** to stop and transcribe
 
 ### Audio feedback
 
@@ -152,7 +156,8 @@ Uses a Unix socket (`/tmp/ptt.sock`) and PID file (`/tmp/ptt.pid`).
 Open via the menu. Native Cocoa window with:
 - Table of recent dictations (last 50)
 - Editable text view for correcting transcripts
-- "Save Correction" button to update the database
+- **Retry Transcription** button for failed entries (re-sends the saved audio file)
+- **Save Correction** button to update the database
 
 ### Transcript files
 
