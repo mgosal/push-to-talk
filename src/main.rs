@@ -29,7 +29,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSBezelStyle, NSButton, NSButtonType, NSControlStateValueOff,
     NSControlStateValueOn, NSMenu, NSMenuItem, NSPasteboard, NSPopUpButton, NSSecureTextField,
-    NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSWindow, NSWindowStyleMask,
+    NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSWindow, NSWindowStyleMask, NSImage,
 };
 use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
@@ -57,6 +57,7 @@ struct DelegateIvars {
     onboarding_status_label: RefCell<Option<Retained<NSTextField>>>,
     shortcut_btn: RefCell<Option<Retained<NSButton>>>,
     mic_btn: RefCell<Option<Retained<NSButton>>>,
+    login_checkbox: RefCell<Option<Retained<NSButton>>>,
     notifications_checkbox: RefCell<Option<Retained<NSButton>>>,
     /// When set, the menubar icon shows 🟢 until this instant, then reverts to ⚪.
     success_flash_until: Cell<Option<Instant>>,
@@ -256,6 +257,16 @@ define_class!(
             self.reload_config();
         }
 
+        #[unsafe(method(toggleStartAtLogin:))]
+        fn toggle_start_at_login(&self, _sender: &NSButton) {
+            let current = with_config(|c| c.ui.start_at_login).unwrap_or(false);
+            if let Err(e) = config::save_start_at_login(!current) {
+                eprintln!("[ptt] Failed to save: {e}");
+            }
+            self.reload_config();
+            self.update_onboarding_status();
+        }
+
         #[unsafe(method(requestMicrophoneAccess:))]
         fn request_microphone_access(&self, _sender: &NSObject) {
             self.request_microphone_access_from_setup();
@@ -289,6 +300,7 @@ impl AppDelegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(DelegateIvars {
+            login_checkbox: RefCell::new(None),
             status_item: OnceCell::new(),
             status_menu_item: OnceCell::new(),
             toggle_menu_item: OnceCell::new(),
@@ -511,6 +523,21 @@ impl AppDelegate {
         );
         content.addSubview(&help_mic);
 
+        // Start at Login checkbox
+        let login_checkbox = {
+            NSButton::initWithFrame(
+                mtm.alloc(),
+                NSRect::new(NSPoint::new(24.0, 50.0), NSSize::new(220.0, 30.0)),
+            )
+        };
+        login_checkbox.setTitle(&NSString::from_str("Start at Login"));
+        login_checkbox.setButtonType(NSButtonType::Switch);
+        unsafe {
+            login_checkbox.setTarget(Some(target));
+            login_checkbox.setAction(Some(sel!(toggleStartAtLogin:)));
+        };
+        content.addSubview(&login_checkbox);
+
         let status = Self::label(mtm, "", 24.0, 61.0, 506.0, 40.0);
         content.addSubview(&status);
 
@@ -593,6 +620,8 @@ impl AppDelegate {
         button
     }
 
+
+
     fn update_onboarding_status(&self) {
         let key_exists = with_config(|c| c.api_key().is_some()).unwrap_or(false);
         let key_status = if key_exists { "API key saved" } else { "API key missing" };
@@ -632,6 +661,17 @@ impl AppDelegate {
             };
             btn.setTitle(&NSString::from_str(title));
         }
+        let login_enabled = with_config(|c| c.ui.start_at_login).unwrap_or(false);
+        if let Some(cb) = self.ivars().login_checkbox.borrow().as_ref() {
+            {
+                cb.setState(if login_enabled {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
+        }
+
         let notifications_enabled = with_config(|c| c.ui.notifications).unwrap_or(true);
         if let Some(cb) = self.ivars().notifications_checkbox.borrow().as_ref() {
             {
@@ -719,7 +759,11 @@ impl AppDelegate {
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
 
         if let Some(button) = status_item.button(mtm) {
-            button.setTitle(&NSString::from_str("⚪"));
+            if let Some(image) = NSImage::imageNamed(&NSString::from_str("circle.fill")) {
+                button.setImage(Some(&image));
+            } else {
+                button.setTitle(&NSString::from_str("⚪"));
+            }
         }
 
         let menu = NSMenu::new(mtm);
@@ -975,9 +1019,24 @@ impl AppDelegate {
 
     fn update_icon(&self, icon: &str) {
         let mtm = MainThreadMarker::from(self);
+        let sf_symbol = match icon {
+            "⚪" => "circle.fill",
+            "🟡" => "circle.fill",
+            "🔒" => "lock.fill",
+            "✅" => "checkmark.circle.fill",
+            "❌" => "xmark.circle.fill",
+            _ => "",
+        };
+
         if let Some(si) = self.ivars().status_item.get() {
             if let Some(btn) = si.button(mtm) {
-                btn.setTitle(&NSString::from_str(icon));
+                if !sf_symbol.is_empty() {
+                    if let Some(image) = NSImage::imageNamed(&NSString::from_str(sf_symbol)) {
+                        btn.setImage(Some(&image));
+                    }
+                } else {
+                    btn.setTitle(&NSString::from_str(icon));
+                }
             }
         }
     }
@@ -1016,8 +1075,15 @@ impl AppDelegate {
             let mtm = MainThreadMarker::from(self);
             if let Some(si) = self.ivars().status_item.get() {
                 if let Some(btn) = si.button(mtm) {
-                    let icon = if (frame / 5).is_multiple_of(2) { "🟡" } else { "⚪" };
-                    btn.setTitle(&NSString::from_str(icon));
+                    let icon_symbol = if (frame / 5).is_multiple_of(2) { "circle.fill" } else { "circle.fill" }; 
+                    // We use the same symbol but I could change it if I had different ones.
+                    // For now, let's just make it blink by toggling visibility or something?
+                    // Actually, let's just stick to the current logic but use the image.
+                    // To make it "pulse", I'll toggle between an icon and nothing, or two different icons.
+                    let icon_name = if (frame / 5).is_multiple_of(2) { "circle.fill" } else { "circle.dotted" };
+                    if let Some(image) = NSImage::imageNamed(&NSString::from_str(icon_name)) {
+                        btn.setImage(Some(&image));
+                    }
                 }
             }
         }

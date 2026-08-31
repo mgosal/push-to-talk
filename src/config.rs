@@ -73,6 +73,8 @@ pub struct UiConfig {
     /// Show macOS notifications for transcription results and profile events.
     /// Set to false to suppress all notifications.
     pub notifications: bool,
+    /// Automatically start the app at login.
+    pub start_at_login: bool,
 }
 
 // ── Defaults ──────────────────────────────────────────────────────────
@@ -124,6 +126,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             notifications: true,
+            start_at_login: false,
         }
     }
 }
@@ -285,6 +288,23 @@ pub fn save_notifications(enabled: bool) -> Result<(), String> {
 
     let mut cfg = load();
     cfg.ui.notifications = enabled;
+
+    let config_text = toml::to_string_pretty(&cfg)
+        .map_err(|e| format!("failed to serialise config: {e}"))?;
+    std::fs::write(dir.join("config.toml"), config_text)
+        .map_err(|e| format!("failed to write config: {e}"))?;
+
+    Ok(())
+}
+
+/// Save the start at login setting to config.toml.
+pub fn save_start_at_login(enabled: bool) -> Result<(), String> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create config directory: {e}"))?;
+
+    let mut cfg = load();
+    cfg.ui.start_at_login = enabled;
 
     let config_text = toml::to_string_pretty(&cfg)
         .map_err(|e| format!("failed to serialise config: {e}"))?;

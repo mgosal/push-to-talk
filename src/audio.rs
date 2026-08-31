@@ -106,7 +106,7 @@ pub fn start_recording(output_path: &Path) -> Result<NativeRecorder, String> {
         return Err("audio recorder could not prepare the output file".into());
     }
     if !unsafe { recorder.record() } {
-        return Err("audio recorder could not start recording".into());
+        return Err("audio recorder could not start recording (check microphone permissions)".into());
     }
 
     Ok(NativeRecorder { recorder })
