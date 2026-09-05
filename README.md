@@ -12,7 +12,7 @@ The name nods to Wiz Khalifa's "Black and Yellow": "No keys, push to start."
 
 - macOS 14+ (Apple Silicon or Intel)
 - [Rust toolchain](https://rustup.rs/) (to build)
-- An API key for any OpenAI-compatible audio endpoint
+- An API key for any OpenAI-compatible audio endpoint — or, for offline transcription, `parakeet-mlx` and `ffmpeg` on Apple Silicon (see [Transcription backends](#transcription-backends))
 
 ## Quick start
 
@@ -90,30 +90,46 @@ As you use the app, correct mistakes in the **History & Corrections** window. Ov
 
 ## Usage
 
-A ⚪ icon appears in the menubar.
+A small **PTT** label appears in the menubar, and changes to show the current
+state.
 
-> **Tip:** If the icon is hidden behind the notch or other menu bar icons, **⌘-drag** it to reorder. Drag it leftward so it stays visible on smaller screens.
+> **Tip:** New menu bar items are placed at the *left* end of the icon cluster,
+> not next to the clock. If you can't find it, **⌘-drag** it to reorder.
 
 ### Push-to-talk
 
 Hold **right Option (⌥)** to record. Release to transcribe and paste at your cursor.
 
-| Icon | State |
-|------|-------|
-| ⚪ | Idle |
-| 🔴 | Recording |
-| 🔒 | Locked (hands-free) |
-| 🟡 | Transcribing (pulses) |
-| 🟢 | Transcribed successfully (flashes 500ms) |
+| Menubar | State |
+|---------|-------|
+| `PTT` | Idle |
+| `REC` | Recording |
+| `LOCK` | Locked (hands-free) |
+| `···` | Transcribing (animates) |
+| `✓` | Transcribed successfully (flashes 500ms) |
+
+The label is text rather than an icon on purpose: a template image proved
+unreliable to render in the menu bar during testing, and the words state the
+mode outright.
 
 ### Locked dictation
 
 For longer dictation without holding a key:
 
-1. Hold **right Option** (starts recording)
-2. Press **left arrow** while holding right Option (engages lock)
-3. Release everything — recording continues hands-free
-4. Press **right Option** or **Escape** to stop and transcribe
+1. **Tap right Option** (a quick press, under 400ms) — recording continues hands-free
+2. **Tap right Option again**, or press **Escape**, to stop and transcribe
+
+A tap is a press too short to be speech, so it costs nothing: presses that
+brief were discarded as "too short" before.
+
+Right Option is also the accent modifier (⌥e, ⌥u, ⌥3), so a press with any
+other key involved is never treated as a tap — typing `café` behaves normally.
+
+> **Earlier versions** used Option+Left Arrow to engage the lock. That could
+> not work correctly: the event tap is listen-only and cannot swallow a
+> keystroke, so the arrow always reached the focused app and moved the caret in
+> whatever you were typing. A bare Option tap types nothing, so there is
+> nothing to swallow.
 
 ### Audio feedback
 
@@ -173,6 +189,52 @@ transcripts_dir = "~/dictation/transcripts"
 All config lives in `~/.config/push-to-talk/config.toml`. Every field has a default — the only requirement is an API key.
 
 See [`config.example.toml`](config.example.toml) for the full reference with comments.
+
+### Transcription backends
+
+Two engines are available, selected by `[transcription] backend`:
+
+| | `"api"` (default) | `"local"` |
+|---|---|---|
+| Runs | OpenAI-compatible HTTP API | on-device, via `parakeet-mlx` |
+| Needs | API key + network | one-time model download |
+| Audio | uploaded to the provider | never leaves the machine |
+| Speaker profile | primes the model | not used (acoustic model, no priming) |
+| Silence / noise | can return non-transcript text | returns nothing |
+
+Parakeet TDT is a transducer with no autoregressive text decoder, so it
+structurally cannot invent fluent text from silence — it returns empty text,
+which the app reports as "No speech detected" rather than pasting. The API
+backend keeps an edge on domain vocabulary when a speaker profile is supplied,
+which is why both are kept.
+
+To run fully offline:
+
+```bash
+brew install ffmpeg               # parakeet-mlx decodes audio through it
+uv tool install parakeet-mlx      # or: pip install parakeet-mlx
+```
+
+```toml
+[transcription]
+backend = "local"
+
+[transcription.local]
+# Must have parakeet-mlx importable. A uv wrapper avoids touching system Python:
+command = ["uv", "run", "--no-project", "--with", "parakeet-mlx", "python"]
+model = "mlx-community/parakeet-tdt-0.6b-v3"
+```
+
+The sidecar is given `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`
+on top of the inherited `PATH`, because an app launched from Finder gets
+launchd's minimal one and would otherwise find neither `uv` nor `ffmpeg`.
+
+The model is loaded once into a long-lived sidecar process at app launch, so
+only the first dictation of a cold install waits (the initial download is
+~2.5 GB). If the sidecar can't start — dependency missing, bad model id — the
+app logs the reason, notifies once, and transcribes through the API backend so
+dictation keeps working. See `[transcription.local]` in
+[`config.example.toml`](config.example.toml) for every knob.
 
 ### Audio capture
 
@@ -236,7 +298,9 @@ make bundle
 
 ## Privacy
 
-Audio recordings are sent to the configured OpenAI-compatible API provider for transcription. Speaker profile generation, calibration, and correction learning also send the selected context text, profile text, calibration samples, or correction pairs to that provider.
+With `backend = "local"`, audio is transcribed on-device and no recording leaves the machine. Note that the local backend falls back to the API backend when the local model cannot be started, so set it up and check the log if offline-only operation matters to you.
+
+With the default `backend = "api"`, audio recordings are sent to the configured OpenAI-compatible API provider for transcription. Speaker profile generation, calibration, and correction learning also send the selected context text, profile text, calibration samples, or correction pairs to that provider.
 
 API keys are stored locally in `~/.config/push-to-talk/api-key` by default. Dictation history is stored locally in SQLite, and optional transcript files are written only when `transcripts_dir` is configured.
 
@@ -263,8 +327,14 @@ API keys are stored locally in `~/.config/push-to-talk/api-key` by default. Dict
        │ sends WAV
 ┌──────┴───────┐
 │  Transcribe   │  Background thread
-│  Thread       │  reqwest → API → paste → SQLite → notify
-└──────────────┘
+│  Thread       │  backend → paste → SQLite → notify
+└──────┬───────┘
+       │ one of
+┌──────┴───────┐  ┌────────────────┐
+│  API backend  │  │ Local backend   │
+│  reqwest →    │  │ warm sidecar →  │
+│  OpenAI-compat│  │ parakeet-mlx    │
+└──────────────┘  └────────────────┘
 ```
 
 ## Troubleshooting
@@ -289,6 +359,23 @@ Check your API key is valid and the endpoint is reachable:
 test -s ~/.config/push-to-talk/api-key && echo "API key file exists"
 curl -s https://openrouter.ai/api/v1/models | head -1   # should return JSON
 ```
+
+### Local backend falls back to the API
+
+The app logs the reason on startup and before the first fallback. Look for
+`[ptt] Local transcription unavailable:` and any `[parakeet]` lines, then
+reproduce the sidecar by hand with the same launcher your config uses:
+
+```bash
+echo '' | uv run --no-project --with parakeet-mlx python \
+  ~/.config/push-to-talk/parakeet_sidecar.py mlx-community/parakeet-tdt-0.6b-v3
+```
+
+A healthy sidecar prints `{"ready": true, ...}`. Anything else prints
+`{"ready": false, "error": "..."}` naming the cause — most often that
+`parakeet-mlx` isn't importable from the interpreter in
+`[transcription.local] command`. A sidecar that starts but fails every
+recording with `Failed to load audio` is missing `ffmpeg`.
 
 ## License
 

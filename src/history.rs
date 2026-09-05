@@ -98,6 +98,7 @@ define_class!(
                     "success" => "✓".to_string(),
                     "hallucination" => "⚠".to_string(),
                     "error" => "✗".to_string(),
+                    "empty" => "∅".to_string(),
                     _ => "?".to_string(),
                 },
                 "time" => {
