@@ -1,7 +1,7 @@
 //! Push-to-talk — voice typing for macOS
 //!
 //! Hold right Option to talk, release to transcribe and paste at cursor.
-//! Supports locked dictation (right Opt + left arrow), history & corrections,
+//! Supports locked dictation (tap right Opt), history & corrections,
 //! IPC control (--toggle, --status), and transcript file saving.
 
 mod audio;
@@ -11,6 +11,7 @@ mod db;
 mod history;
 mod hotkey;
 mod ipc;
+mod local;
 mod notification;
 mod paste;
 mod session;
@@ -19,6 +20,7 @@ mod transcribe;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,7 +31,8 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSBezelStyle, NSButton, NSButtonType, NSControlStateValueOff,
     NSControlStateValueOn, NSMenu, NSMenuItem, NSPasteboard, NSPopUpButton, NSSecureTextField,
-    NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSWindow, NSWindowStyleMask, NSImage,
+    NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextField,
+    NSVariableStatusItemLength, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
@@ -54,6 +57,7 @@ struct DelegateIvars {
     onboarding_window: RefCell<Option<Retained<NSWindow>>>,
     api_key_field: RefCell<Option<Retained<NSSecureTextField>>>,
     provider_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    backend_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     onboarding_status_label: RefCell<Option<Retained<NSTextField>>>,
     shortcut_btn: RefCell<Option<Retained<NSButton>>>,
     mic_btn: RefCell<Option<Retained<NSButton>>>,
@@ -130,6 +134,17 @@ define_class!(
 
             if self.should_show_onboarding() {
                 self.show_onboarding_window(mtm);
+            }
+
+            // Load the local model now so the first dictation isn't the one
+            // that waits for it.
+            if let Some((true, local_cfg)) = with_config(|c| {
+                (
+                    c.backend() == config::Backend::Local && c.transcription.local.warm_up,
+                    c.transcription.local.clone(),
+                )
+            }) {
+                local::warm_up(&local_cfg);
             }
 
             eprintln!("[ptt] Ready — hold right Option to dictate");
@@ -228,6 +243,11 @@ define_class!(
             self.show_onboarding_window(mtm);
         }
 
+        #[unsafe(method(changeBackend:))]
+        fn change_backend(&self, _sender: &NSObject) {
+            self.apply_backend_selection();
+        }
+
         #[unsafe(method(saveApiKey:))]
         fn save_api_key(&self, _sender: &NSObject) {
             self.save_api_key_from_setup();
@@ -287,6 +307,33 @@ fn with_config<T>(f: impl FnOnce(&config::Config) -> T) -> Option<T> {
     CONFIG.lock().ok().and_then(|c| c.as_ref().map(f))
 }
 
+/// Fixed width of the menubar item, in points. Sized for the widest label.
+const MENUBAR_WIDTH: f64 = 52.0;
+
+/// The menubar label for each app state.
+///
+/// Text rather than an SF Symbol image. The image path was conventional and
+/// looked correct — the symbol resolved at the right size and the item
+/// reported itself visible — but it could not be seen in the menu bar during
+/// testing, while a minimal text-only status item was spotted immediately.
+/// Text also states the mode outright instead of asking the eye to tell two
+/// small grey glyphs apart.
+fn label_for_state(state: &str) -> &'static str {
+    match state {
+        "🔴" => "REC",   // recording
+        "🔒" => "LOCK",  // locked, hands-free
+        "🟡" => "···",   // working
+        "🟢" => "✓",     // transcribed
+        _ => "PTT",      // idle
+    }
+}
+
+/// Draw the menubar label. The item's width is fixed at creation, so only the
+/// title changes as the app moves between states.
+fn set_button_label(button: &NSStatusBarButton, label: &str) {
+    button.setTitle(&NSString::from_str(label));
+}
+
 /// Truncate to at most `max_chars` characters without splitting a UTF-8
 /// character (byte slicing would panic on multi-byte chars like ✓ or emoji).
 fn truncate_chars(s: &str, max_chars: usize) -> &str {
@@ -311,6 +358,7 @@ impl AppDelegate {
             onboarding_window: RefCell::new(None),
             api_key_field: RefCell::new(None),
             provider_popup: RefCell::new(None),
+            backend_popup: RefCell::new(None),
             onboarding_status_label: RefCell::new(None),
             shortcut_btn: RefCell::new(None),
             mic_btn: RefCell::new(None),
@@ -337,7 +385,11 @@ impl AppDelegate {
     }
 
     fn should_show_onboarding(&self) -> bool {
-        let missing_key = with_config(|c| c.api_key().is_none()).unwrap_or(true);
+        // The local backend needs no key, so a missing one isn't a blocker there.
+        let missing_key = with_config(|c| {
+            c.backend() == config::Backend::Api && c.api_key().is_none()
+        })
+        .unwrap_or(true);
         missing_key || !hotkey::is_accessibility_trusted() || !audio::microphone_access_granted()
     }
 
@@ -366,12 +418,13 @@ impl AppDelegate {
         *self.ivars().onboarding_window.borrow_mut() = None;
         *self.ivars().api_key_field.borrow_mut() = None;
         *self.ivars().provider_popup.borrow_mut() = None;
+        *self.ivars().backend_popup.borrow_mut() = None;
         *self.ivars().onboarding_status_label.borrow_mut() = None;
         *self.ivars().shortcut_btn.borrow_mut() = None;
         *self.ivars().mic_btn.borrow_mut() = None;
         *self.ivars().notifications_checkbox.borrow_mut() = None;
 
-        let frame = NSRect::new(NSPoint::new(260.0, 260.0), NSSize::new(560.0, 445.0));
+        let frame = NSRect::new(NSPoint::new(260.0, 260.0), NSSize::new(560.0, 489.0));
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable;
@@ -394,11 +447,45 @@ impl AppDelegate {
             mtm,
             "Set up Push to Talk",
             24.0,
-            360.0,
+            404.0,
             500.0,
             24.0,
         );
         content.addSubview(&title);
+
+        // ── Transcription engine ──
+        let backend_label = Self::label(mtm, "Transcription", 24.0, 358.0, 180.0, 22.0);
+        content.addSubview(&backend_label);
+
+        let backend_popup = {
+            NSPopUpButton::initWithFrame_pullsDown(
+                mtm.alloc(),
+                NSRect::new(NSPoint::new(210.0, 356.0), NSSize::new(300.0, 26.0)),
+                false,
+            )
+        };
+        // Naming the model in the item itself answers "which one is running?"
+        // without spending another row on it.
+        let (local_title, api_title) = with_config(|c| {
+            (
+                format!(
+                    "On this Mac — {}",
+                    config::short_model_name(&c.transcription.local.model)
+                ),
+                format!("Cloud API — {}", config::short_model_name(&c.api.model)),
+            )
+        })
+        .unwrap_or_else(|| ("On this Mac".into(), "Cloud API".into()));
+        backend_popup.addItemWithTitle(&NSString::from_str(&local_title));
+        backend_popup.addItemWithTitle(&NSString::from_str(&api_title));
+        if with_config(|c| c.backend()).unwrap_or(config::Backend::Api) == config::Backend::Api {
+            backend_popup.selectItemWithTitle(&NSString::from_str(&api_title));
+        }
+        unsafe {
+            backend_popup.setTarget(Some(target));
+            backend_popup.setAction(Some(sel!(changeBackend:)));
+        }
+        content.addSubview(&backend_popup);
 
         let api_label = Self::label(
             mtm,
@@ -556,6 +643,7 @@ impl AppDelegate {
         content.addSubview(&notifications_cb);
 
         *self.ivars().provider_popup.borrow_mut() = Some(provider_popup);
+        *self.ivars().backend_popup.borrow_mut() = Some(backend_popup);
         *self.ivars().api_key_field.borrow_mut() = Some(key_field);
         *self.ivars().onboarding_status_label.borrow_mut() = Some(status);
         *self.ivars().shortcut_btn.borrow_mut() = Some(shortcut_btn);
@@ -684,6 +772,47 @@ impl AppDelegate {
         }
     }
 
+    /// Apply the transcription engine chosen in the Setup window.
+    ///
+    /// Switching to local starts the model loading immediately rather than
+    /// making the next dictation wait for it; switching away releases it.
+    fn apply_backend_selection(&self) {
+        let index = self
+            .ivars()
+            .backend_popup
+            .borrow()
+            .as_ref()
+            .map(|p| p.indexOfSelectedItem());
+        let Some(index) = index else { return };
+
+        let backend = if index == 0 {
+            config::Backend::Local
+        } else {
+            config::Backend::Api
+        };
+
+        if let Err(e) = config::save_backend(backend) {
+            eprintln!("[ptt] Failed to save transcription backend: {e}");
+            self.update_ui("⚪", &format!("✗ {e}"));
+            return;
+        }
+        self.reload_config();
+
+        match backend {
+            config::Backend::Local => {
+                self.update_ui("⚪", "Transcribing on this Mac — loading model…");
+                if let Some(cfg) = with_config(|c| c.transcription.local.clone()) {
+                    local::warm_up(&cfg);
+                }
+            }
+            config::Backend::Api => {
+                local::shutdown();
+                self.update_ui("⚪", "Transcribing via the cloud API");
+            }
+        }
+        self.update_onboarding_status();
+    }
+
     fn save_api_key_from_setup(&self) {
         let key = match self.ivars().api_key_field.borrow().as_ref() {
             Some(field) => field.stringValue().to_string(),
@@ -758,12 +887,11 @@ impl AppDelegate {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
 
+        // An explicit width rather than NSVariableStatusItemLength, so the item
+        // cannot size itself to nothing. Wide enough for "LOCK".
+        status_item.setLength(MENUBAR_WIDTH);
         if let Some(button) = status_item.button(mtm) {
-            if let Some(image) = NSImage::imageNamed(&NSString::from_str("circle.fill")) {
-                button.setImage(Some(&image));
-            } else {
-                button.setTitle(&NSString::from_str("⚪"));
-            }
+            set_button_label(&button, label_for_state(""));
         }
 
         let menu = NSMenu::new(mtm);
@@ -924,13 +1052,14 @@ impl AppDelegate {
                         self.on_push_up();
                     }
                 }
-                hotkey::HotkeyEvent::LeftArrowDown => {
-                    let mode = self.ivars().mode.get();
-                    if mode == AppMode::Recording {
-                        // Enter locked mode
+                hotkey::HotkeyEvent::Tap => {
+                    // A tap arrives just after its PushDown started recording.
+                    // Recording  → hands-free from here.
+                    // Locked     → the PushDown already stopped us; nothing to do.
+                    if self.ivars().mode.get() == AppMode::Recording {
                         self.ivars().mode.set(AppMode::Locked);
                         audio::play_tone(audio::Tone::Lock);
-                        self.update_ui("🔒", "🔒 Locked — press right ⌥ or Esc to stop");
+                        self.update_ui("🔒", "🔒 Locked — tap right ⌥ or press Esc to stop");
                         self.update_toggle_title("Stop Recording (locked)");
                         eprintln!("[ptt] Locked dictation mode engaged");
                     }
@@ -994,12 +1123,7 @@ impl AppDelegate {
     }
 
     fn update_ui(&self, icon: &str, status: &str) {
-        let mtm = MainThreadMarker::from(self);
-        if let Some(si) = self.ivars().status_item.get() {
-            if let Some(btn) = si.button(mtm) {
-                btn.setTitle(&NSString::from_str(icon));
-            }
-        }
+        self.update_icon(icon);
         if let Some(mi) = self.ivars().status_menu_item.get() {
             // Truncate for menu display, store full text for copy
             let display = if status.chars().count() > 60 {
@@ -1018,25 +1142,15 @@ impl AppDelegate {
     }
 
     fn update_icon(&self, icon: &str) {
-        let mtm = MainThreadMarker::from(self);
-        let sf_symbol = match icon {
-            "⚪" => "circle.fill",
-            "🟡" => "circle.fill",
-            "🔒" => "lock.fill",
-            "✅" => "checkmark.circle.fill",
-            "❌" => "xmark.circle.fill",
-            _ => "",
-        };
+        self.set_label(label_for_state(icon));
+    }
 
+    /// Set the menubar label, if the status item exists yet.
+    fn set_label(&self, label: &str) {
+        let mtm = MainThreadMarker::from(self);
         if let Some(si) = self.ivars().status_item.get() {
             if let Some(btn) = si.button(mtm) {
-                if !sf_symbol.is_empty() {
-                    if let Some(image) = NSImage::imageNamed(&NSString::from_str(sf_symbol)) {
-                        btn.setImage(Some(&image));
-                    }
-                } else {
-                    btn.setTitle(&NSString::from_str(icon));
-                }
+                set_button_label(&btn, label);
             }
         }
     }
@@ -1070,22 +1184,11 @@ impl AppDelegate {
         let frame = self.ivars().pulse_frame.get() + 1;
         self.ivars().pulse_frame.set(frame);
 
-        // Toggle every 5 ticks (500ms at 100ms poll interval)
+        // Toggle every 5 ticks (500ms at the 100ms poll interval).
         if frame.is_multiple_of(5) {
-            let mtm = MainThreadMarker::from(self);
-            if let Some(si) = self.ivars().status_item.get() {
-                if let Some(btn) = si.button(mtm) {
-                    let icon_symbol = if (frame / 5).is_multiple_of(2) { "circle.fill" } else { "circle.fill" }; 
-                    // We use the same symbol but I could change it if I had different ones.
-                    // For now, let's just make it blink by toggling visibility or something?
-                    // Actually, let's just stick to the current logic but use the image.
-                    // To make it "pulse", I'll toggle between an icon and nothing, or two different icons.
-                    let icon_name = if (frame / 5).is_multiple_of(2) { "circle.fill" } else { "circle.dotted" };
-                    if let Some(image) = NSImage::imageNamed(&NSString::from_str(icon_name)) {
-                        btn.setImage(Some(&image));
-                    }
-                }
-            }
+            // Cycle the ellipsis so the label visibly works rather than sits.
+            let label = if (frame / 5).is_multiple_of(2) { "···" } else { "·· " };
+            self.set_label(label);
         }
     }
 
@@ -1557,45 +1660,149 @@ struct TranscribeResult {
     hallucination: bool,
 }
 
-fn do_transcription(audio_path: &Path) -> TranscribeResult {
-    let (endpoint, model, api_key, profile, max_wps, db, max_retries, retry_backoff, transcripts_dir) =
-        match with_config(|c| {
-            (
-                c.api.endpoint.clone(),
-                c.api.model.clone(),
-                c.api_key(),
-                c.speaker_profile(),
-                c.transcription.max_wps,
-                c.db_path(),
-                c.api.max_retries,
-                c.api.retry_backoff.clone(),
-                c.transcripts_dir(),
-            )
-        }) {
-            Some((endpoint, model, Some(key), profile, max_wps, db, retries, backoff, tdir)) => {
-                (endpoint, model, key, profile, max_wps, db, retries, backoff, tdir)
-            }
-            Some((_, _, None, _, _, db, _, _, _)) => {
-                let err = "No API key configured".to_string();
-                db::record(&db, audio_path.to_str(), None, "error", Some(&err), None, None, None);
-                return TranscribeResult { text: None, latency: 0.0, error: Some(err), hallucination: false };
-            }
-            None => {
-                return TranscribeResult { text: None, latency: 0.0, error: Some("Config unavailable".into()), hallucination: false };
-            }
-        };
+/// Everything a transcription needs, snapshotted out of the global config so
+/// the lock is not held across a network call or a model run.
+struct TranscribeSettings {
+    backend: config::Backend,
+    local: config::LocalConfig,
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+    profile: String,
+    max_wps: f64,
+    db: PathBuf,
+    max_retries: u32,
+    retry_backoff: Vec<f64>,
+    transcripts_dir: Option<PathBuf>,
+}
 
-    match transcribe::transcribe(&endpoint, &model, &api_key, &profile, audio_path, max_retries, &retry_backoff) {
+impl TranscribeSettings {
+    fn snapshot(c: &config::Config) -> Self {
+        Self {
+            backend: c.backend(),
+            local: c.transcription.local.clone(),
+            endpoint: c.api.endpoint.clone(),
+            model: c.api.model.clone(),
+            api_key: c.api_key(),
+            profile: c.speaker_profile(),
+            max_wps: c.transcription.max_wps,
+            db: c.db_path(),
+            max_retries: c.api.max_retries,
+            retry_backoff: c.api.retry_backoff.clone(),
+            transcripts_dir: c.transcripts_dir(),
+        }
+    }
+}
+
+/// Whether the user has already been told that local transcription fell back
+/// to the API. Warning on every dictation would be noise; once per outage is
+/// enough, and a later local success re-arms it.
+static LOCAL_FALLBACK_NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+fn transcribe_via_api(
+    settings: &TranscribeSettings,
+    audio_path: &Path,
+) -> Result<transcribe::TranscriptionResult, String> {
+    let api_key = settings
+        .api_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .ok_or("No API key configured")?;
+    transcribe::transcribe(
+        &settings.endpoint,
+        &settings.model,
+        api_key,
+        &settings.profile,
+        audio_path,
+        settings.max_retries,
+        &settings.retry_backoff,
+    )
+}
+
+/// Run the configured backend, falling back to the API if a local run fails.
+///
+/// Returns the result along with the model label to record, so history shows
+/// which engine actually produced the transcript.
+fn run_backend(
+    settings: &TranscribeSettings,
+    audio_path: &Path,
+) -> (
+    Result<transcribe::TranscriptionResult, String>,
+    String,
+    config::Backend,
+) {
+    let api = |s: &TranscribeSettings| {
+        (
+            transcribe_via_api(s, audio_path),
+            s.model.clone(),
+            config::Backend::Api,
+        )
+    };
+
+    if settings.backend != config::Backend::Local {
+        return api(settings);
+    }
+
+    match local::transcribe(&settings.local, audio_path) {
         Ok(result) => {
-            let hallucination = transcribe::is_hallucination(&result.text, result.duration_s, max_wps);
+            LOCAL_FALLBACK_NOTIFIED.store(false, Ordering::Relaxed);
+            (Ok(result), settings.local.model.clone(), config::Backend::Local)
+        }
+        Err(e) => {
+            eprintln!("[ptt] Local transcription failed ({e}) — falling back to the API backend");
+            if !LOCAL_FALLBACK_NOTIFIED.swap(true, Ordering::Relaxed) {
+                notification::notify(
+                    "Local transcription unavailable",
+                    &format!("Using the API backend instead: {}", truncate_chars(&e, 120)),
+                );
+            }
+            api(settings)
+        }
+    }
+}
 
-            if hallucination {
-                let reason = transcribe::is_format_hallucination(&result.text)
-                    .unwrap_or("WPS exceeded");
+fn do_transcription(audio_path: &Path) -> TranscribeResult {
+    let Some(settings) = with_config(TranscribeSettings::snapshot) else {
+        return TranscribeResult {
+            text: None,
+            latency: 0.0,
+            error: Some("Config unavailable".into()),
+            hallucination: false,
+        };
+    };
+    let db = settings.db.clone();
+    let transcripts_dir = settings.transcripts_dir.clone();
+    let max_wps = settings.max_wps;
+
+    // The guards that apply depend on which engine actually produced the text,
+    // which is not always the one configured — a local failure falls back.
+    let (outcome, model, backend_used) = run_backend(&settings, audio_path);
+
+    match outcome {
+        Ok(result) => {
+            // Parakeet returns empty text for silence or noise rather than
+            // inventing speech. Pasting nothing would be a silent no-op, so
+            // report it instead of treating it as a successful dictation.
+            if result.text.trim().is_empty() {
+                let err = "No speech detected".to_string();
+                eprintln!("[ptt] {err} ({:.1}s of audio)", result.duration_s);
+                db::record(
+                    &db, audio_path.to_str(), None, "empty",
+                    Some(&err), Some(result.latency_s), Some(result.wps), Some(result.duration_s),
+                );
+                return TranscribeResult {
+                    text: None, latency: result.latency_s,
+                    error: Some(err), hallucination: false,
+                };
+            }
+
+            if let Some(reason) = transcribe::hallucination_reason(
+                &result.text, result.duration_s, max_wps, backend_used,
+            ) {
                 eprintln!("[ptt] Hallucination detected: {reason} (WPS={:.1})", result.wps);
                 db::record(
                     &db, audio_path.to_str(), Some(&result.text), "hallucination",
-                    Some(reason), Some(result.latency_s), Some(result.wps), Some(result.duration_s),
+                    Some(&reason), Some(result.latency_s), Some(result.wps), Some(result.duration_s),
                 );
 
                 // Save hallucination transcript file
