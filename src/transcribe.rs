@@ -78,6 +78,33 @@ pub fn is_wps_hallucination(text: &str, duration_s: f64, max_wps: f64) -> bool {
     words / duration_s > max_wps
 }
 
+/// Fraction of unknown tokens above which a transcript is treated as garbage.
+const MAX_UNK_RATIO: f64 = 0.25;
+
+/// Whether a transcript is mostly unknown tokens.
+///
+/// A transducer emits `<unk>` when it cannot map audio to any token. A few are
+/// normal in noisy speech; a transcript that is largely `<unk>` is a failed
+/// decode. This was observed in the wild — 19s of clear speech came back as
+/// nothing but `<unk>` and was recorded as a success, then transcribed
+/// correctly from the same file moments later, so the failure is transient and
+/// worth retrying rather than surfacing.
+pub fn unk_ratio(text: &str) -> f64 {
+    let tokens = text.split_whitespace().count();
+    if tokens == 0 {
+        return 0.0;
+    }
+    let unk = text.matches("<unk>").count();
+    // <unk> runs together without spaces, so count against the larger of the
+    // two: whitespace tokens, or the number of <unk> markers found.
+    unk as f64 / tokens.max(unk) as f64
+}
+
+/// Whether this transcript looks like a failed decode that a retry may fix.
+pub fn is_failed_decode(text: &str) -> bool {
+    unk_ratio(text) > MAX_UNK_RATIO
+}
+
 /// Run the hallucination guards that apply to `backend`, returning the reason
 /// a transcript should be rejected.
 ///
@@ -94,6 +121,14 @@ pub fn hallucination_reason(
     max_wps: f64,
     backend: crate::config::Backend,
 ) -> Option<String> {
+    // Applies to any backend: a transcript that is mostly unknown tokens is
+    // garbage whoever produced it, and must never reach the clipboard.
+    if is_failed_decode(text) {
+        return Some(format!(
+            "{:.0}% unknown tokens — failed decode",
+            unk_ratio(text) * 100.0
+        ));
+    }
     if backend == crate::config::Backend::Api {
         if let Some(reason) = is_format_hallucination(text) {
             return Some(reason.to_string());
@@ -447,6 +482,21 @@ mod tests {
             is_format_hallucination("As an AI, I cannot assist with that."),
             Some("looks like assistant response")
         );
+    }
+
+    #[test]
+    fn detects_a_transcript_that_is_mostly_unknown_tokens() {
+        // The real failure: 19s of speech decoded as nothing but <unk>.
+        assert!(is_failed_decode("<unk><unk><unk><unk><unk><unk><unk><unk>"));
+        assert!(is_failed_decode("<unk> <unk> <unk> hello"));
+    }
+
+    #[test]
+    fn tolerates_the_odd_unknown_token_in_real_speech() {
+        let speech = "so the ignition sequence pattern is what we want here <unk> I think";
+        assert!(!is_failed_decode(speech), "ratio was {}", unk_ratio(speech));
+        assert!(!is_failed_decode("perfectly ordinary speech with no unknowns"));
+        assert!(!is_failed_decode(""));
     }
 
     #[test]

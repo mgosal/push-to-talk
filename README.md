@@ -240,6 +240,28 @@ dictation keeps working. See `[transcription.local]` in
 
 The app records directly through macOS AVFAudio. There is no external audio recorder dependency to install or configure. Temporary recordings are written as WAV files in the configured `audio_dir` or the system temp directory.
 
+### Pasting into remote desktop sessions
+
+By default the transcript is put on the clipboard and delivered with ⌘V. That
+works nearly everywhere, but remote desktop clients — Chrome Remote Desktop,
+Apple Screen Sharing, VNC — relay keystrokes to another machine and rebuild
+modifier state as they go, and a synthesised ⌘ is the fragile part. The symptom
+is unmistakable: the remote text box receives the letter **V** instead of a
+paste.
+
+`[paste] method = "type"` types the transcript directly instead, with no
+modifier involved. That helps local apps that ignore ⌘V, but it does **not**
+fix remote sessions: they forward the raw *keycode* and ignore the Unicode
+character attached to the event, so every character arrives as `a` (keycode 0).
+
+Remote clients care only about `(keycode, modifier state)` — the same pair a
+physical keyboard produces. Delivering text into one reliably therefore means
+either a correctly synthesised ⌘V, or mapping each character to a real keycode
+plus shift state for the active layout. See issue #15.
+
+The clipboard is set whichever method is used, so clipboard history works and
+you can always paste by hand.
+
 ### API key resolution order
 
 1. `key = "..."` in config.toml (inline)

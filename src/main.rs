@@ -11,6 +11,7 @@ mod db;
 mod history;
 mod hotkey;
 mod ipc;
+mod eval;
 mod local;
 mod notification;
 mod paste;
@@ -1094,6 +1095,16 @@ impl AppDelegate {
                         AppMode::Transcribing => {}
                     }
                 }
+                ipc::IpcCommand::Setup => {
+                    let mtm = MainThreadMarker::from(self);
+                    self.show_onboarding_window(mtm);
+                }
+                ipc::IpcCommand::Quit => {
+                    eprintln!("[ptt] Quit requested over IPC");
+                    local::shutdown();
+                    NSApplication::sharedApplication(MainThreadMarker::from(self))
+                        .terminate(None);
+                }
             }
         }
     }
@@ -1664,6 +1675,7 @@ struct TranscribeResult {
 /// the lock is not held across a network call or a model run.
 struct TranscribeSettings {
     backend: config::Backend,
+    paste_method: config::PasteMethod,
     local: config::LocalConfig,
     endpoint: String,
     model: String,
@@ -1680,6 +1692,7 @@ impl TranscribeSettings {
     fn snapshot(c: &config::Config) -> Self {
         Self {
             backend: c.backend(),
+            paste_method: c.paste_method(),
             local: c.transcription.local.clone(),
             endpoint: c.api.endpoint.clone(),
             model: c.api.model.clone(),
@@ -1820,7 +1833,10 @@ fn do_transcription(audio_path: &Path) -> TranscribeResult {
                 };
             }
 
-            paste::paste_text(&result.text);
+            paste::deliver(&result.text, settings.paste_method);
+            if settings.paste_method == config::PasteMethod::Clipboard {
+                notification::notify("Copied — press ⌘V", truncate_chars(&result.text, 60));
+            }
             session::log_voice(&result.text, result.duration_s, result.latency_s, result.wps);
 
             db::record(
@@ -1892,6 +1908,180 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        ipc::CliAction::Setup | ipc::CliAction::Quit => {
+            let cfg = config::load();
+            if !ipc::is_running(&cfg.pid_path()) {
+                eprintln!("push-to-talk is not running");
+                std::process::exit(1);
+            }
+            let command = match ipc::parse_args() {
+                ipc::CliAction::Quit => "quit",
+                _ => "setup",
+            };
+            match ipc::send_command(&cfg.socket_path(), command) {
+                Ok(_) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ipc::CliAction::Last => {
+            // Straight from the database, so this works even when the app is
+            // not running and regardless of whether its menubar item is
+            // reachable — recovering a transcript must never depend on the UI.
+            let cfg = config::load();
+            match db::recent(&cfg.db_path(), 1).into_iter().next() {
+                Some(row) => {
+                    let text = row.corrected.or(row.transcript).unwrap_or_default();
+                    if text.is_empty() {
+                        eprintln!(
+                            "Last dictation ({}) has no transcript: {} {}",
+                            row.timestamp,
+                            row.status,
+                            row.error_detail.unwrap_or_default()
+                        );
+                        std::process::exit(1);
+                    }
+                    paste::set_clipboard_public(&text);
+                    println!("{text}");
+                    eprintln!("\n[copied to clipboard — {} {}]", row.timestamp, row.status);
+                    std::process::exit(0);
+                }
+                None => {
+                    eprintln!("No dictations recorded yet");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ipc::CliAction::ExportDataset(path) => {
+            let cfg = config::load();
+            let samples = eval::load_samples(&cfg.db_path(), 500);
+            if samples.is_empty() {
+                eprintln!("No successful transcripts to export");
+                std::process::exit(1);
+            }
+            let n = samples.len();
+            match std::fs::write(&path, eval::export(&samples)) {
+                Ok(()) => {
+                    let already = samples.iter().filter(|s| s.corrected.is_some()).count();
+                    println!("Wrote {n} samples to {}", path.display());
+                    println!("  {already} already carry a correction");
+                    println!("\nEdit the `corrected:` sections, then run:");
+                    println!("  push-to-talk --import-corrections {}", path.display());
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Could not write {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+        ipc::CliAction::ImportCorrections(path) => {
+            let cfg = config::load();
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Could not read {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            };
+            let pairs = eval::parse_import(&text);
+            let db = cfg.db_path();
+            let mut changed = 0;
+            // Only store a correction that actually differs from what the
+            // model produced — an untouched block is not a correction, and
+            // storing it would flatter the score with free exact matches.
+            let raw_by_id: std::collections::HashMap<i64, String> =
+                eval::load_samples(&db, 5000).into_iter().map(|s| (s.id, s.raw)).collect();
+            let mut unchanged = 0;
+            for (id, corrected) in &pairs {
+                match raw_by_id.get(id) {
+                    Some(raw) if raw.trim() == corrected.trim() => unchanged += 1,
+                    _ => {
+                        db::save_correction(&db, *id, corrected);
+                        changed += 1;
+                    }
+                }
+            }
+            println!("{unchanged} blocks were left unedited (counted as already correct)");
+            println!("Imported {changed} corrections from {}", path.display());
+            println!("Score them with:  push-to-talk --score");
+            std::process::exit(0);
+        }
+        ipc::CliAction::Score(path) => {
+            let cfg = config::load();
+            // Prefer an edited file: it carries every reviewed sample,
+            // including the ones that needed no correction. Scoring from the
+            // database alone would only see samples known to be wrong.
+            let scored: Vec<(i64, String, String)> = match &path {
+                Some(p) => match std::fs::read_to_string(p) {
+                    Ok(text) => eval::parse_scored(&text),
+                    Err(e) => {
+                        eprintln!("Could not read {}: {e}", p.display());
+                        std::process::exit(1);
+                    }
+                },
+                None => eval::load_samples(&cfg.db_path(), 5000)
+                    .into_iter()
+                    .filter_map(|s| s.corrected.map(|c| (s.id, s.raw, c)))
+                    .collect(),
+            };
+            if scored.is_empty() {
+                eprintln!("Nothing to score — pass the edited file: --score <file>");
+                std::process::exit(1);
+            }
+            if path.is_none() {
+                eprintln!(
+                    "note: scoring stored corrections only, so this measures the\n\
+                     samples already known to be wrong. Pass the edited file for\n\
+                     a representative rate: --score <file>\n"
+                );
+            }
+
+            let mut missing: std::collections::HashMap<String, usize> = Default::default();
+            let mut spurious: std::collections::HashMap<String, usize> = Default::default();
+            let (mut sw, mut sc) = (0.0, 0.0);
+            let (mut perfect, mut edited) = (0, 0);
+            for (_, raw, corrected) in &scored {
+                let w = eval::wer(corrected, raw);
+                sw += w;
+                sc += eval::cer(corrected, raw);
+                if w == 0.0 {
+                    perfect += 1;
+                } else {
+                    edited += 1;
+                }
+                let (m, sp) = eval::word_diff(corrected, raw);
+                for (k, v) in m {
+                    *missing.entry(k).or_default() += v;
+                }
+                for (k, v) in sp {
+                    *spurious.entry(k).or_default() += v;
+                }
+            }
+            let n = scored.len() as f64;
+            println!("Parakeet, scored against your corrections");
+            println!("  samples reviewed  {}", scored.len());
+            println!("  already correct   {perfect} ({:.0}%)", perfect as f64 / n * 100.0);
+            println!("  needed a fix      {edited}");
+            println!("  word error rate   {:.2}%", sw / n * 100.0);
+            println!("  char error rate   {:.2}%", sc / n * 100.0);
+
+            let mut top: Vec<_> = missing.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("\nWords you said that Parakeet missed:");
+            for (w, c) in top.iter().take(15) {
+                println!("  {c:4}  {w}");
+            }
+            let mut top: Vec<_> = spurious.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("\nWords Parakeet produced that you did not say:");
+            for (w, c) in top.iter().take(15) {
+                println!("  {c:4}  {w}");
+            }
+            std::process::exit(0);
         }
         ipc::CliAction::RunApp => {
             // Continue to run the menubar app

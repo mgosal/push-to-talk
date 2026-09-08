@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub api: ApiConfig,
     pub audio: AudioConfig,
+    pub paste: PasteConfig,
     pub transcription: TranscriptionConfig,
     pub storage: StorageConfig,
     pub ui: UiConfig,
@@ -41,6 +42,46 @@ pub struct ApiConfig {
 pub struct AudioConfig {
     /// Minimum recording duration in seconds. Shorter recordings are discarded.
     pub min_duration_s: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PasteConfig {
+    /// How the transcript reaches the focused app: `"shortcut"` or `"type"`.
+    pub method: String,
+}
+
+/// How a transcript is delivered to the focused application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteMethod {
+    /// Put the text on the clipboard and send ⌘V as Core Graphics events.
+    Shortcut,
+    /// Type the text as Unicode key events. Needs no modifier, but remote
+    /// desktop sessions forward the raw keycode and drop the Unicode payload,
+    /// so every character arrives as "a" there. Local use only.
+    Type,
+    /// Put the text on the clipboard and ask System Events to press ⌘V.
+    /// Routed through the Accessibility API rather than synthesised directly,
+    /// which some applications honour when Core Graphics events are ignored.
+    AppleScript,
+    /// Put the text on the clipboard and stop. Nothing is injected, so this
+    /// works everywhere; the user presses ⌘V themselves. The reliable choice
+    /// for remote desktop sessions, which discard synthetic modifiers.
+    Clipboard,
+}
+
+/// Parse the `[paste] method` value, defaulting to the shortcut on a typo.
+pub fn parse_paste_method(value: &str) -> PasteMethod {
+    match value.trim().to_lowercase().as_str() {
+        "type" | "typing" | "keystrokes" => PasteMethod::Type,
+        "applescript" | "system-events" | "osascript" => PasteMethod::AppleScript,
+        "clipboard" | "copy" | "copy-only" => PasteMethod::Clipboard,
+        "shortcut" | "paste" | "" => PasteMethod::Shortcut,
+        other => {
+            eprintln!("[ptt] Unknown paste method \"{other}\" — using \"shortcut\"");
+            PasteMethod::Shortcut
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -86,6 +127,15 @@ pub struct LocalConfig {
     pub request_timeout_s: f64,
     /// Load the model at app launch rather than on the first dictation.
     pub warm_up: bool,
+    /// Split recordings longer than this (seconds) into overlapping chunks
+    /// before decoding. The TDT decoder is run unchunked below this length;
+    /// past it, unchunked decoding silently drops the tail of the audio
+    /// instead of erroring, so long dictations need chunking to come back
+    /// complete.
+    pub chunk_duration_s: f64,
+    /// Overlap between consecutive chunks, in seconds. Only used once a
+    /// recording exceeds `chunk_duration_s`.
+    pub chunk_overlap_s: f64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -135,6 +185,12 @@ impl Default for AudioConfig {
     }
 }
 
+impl Default for PasteConfig {
+    fn default() -> Self {
+        Self { method: "shortcut".into() }
+    }
+}
+
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
@@ -154,8 +210,13 @@ impl Default for LocalConfig {
             model: "mlx-community/parakeet-tdt-0.6b-v3".into(),
             // A cold start downloads ~2.5 GB of weights once.
             ready_timeout_s: 600.0,
-            request_timeout_s: 120.0,
+            // Chunked decoding of a long recording is still one request, but
+            // it now takes longer than a short one to come back — leave
+            // headroom above the chunking threshold below.
+            request_timeout_s: 300.0,
             warm_up: true,
+            chunk_duration_s: 60.0,
+            chunk_overlap_s: 15.0,
         }
     }
 }
@@ -457,6 +518,11 @@ impl Config {
         })
     }
 
+    /// Resolve how transcripts should be delivered to the focused app.
+    pub fn paste_method(&self) -> PasteMethod {
+        parse_paste_method(&self.paste.method)
+    }
+
     /// Resolve the configured transcription backend.
     pub fn backend(&self) -> Backend {
         parse_backend(&self.transcription.backend)
@@ -516,8 +582,9 @@ fn resolve_path(p: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_backend, short_model_name, text_model_for, transcription_endpoint,
-        transcription_model, uses_transcription_endpoint, Backend, TranscriptionConfig,
+        parse_backend, parse_paste_method, short_model_name, text_model_for,
+        transcription_endpoint, transcription_model, uses_transcription_endpoint, Backend,
+        PasteMethod, TranscriptionConfig,
     };
 
     #[test]
@@ -597,5 +664,17 @@ mod tests {
         );
         assert_eq!(short_model_name("gpt-4o-transcribe"), "gpt-4o-transcribe");
         assert_eq!(short_model_name("openai/gpt-4o-transcribe"), "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn parses_paste_methods_and_falls_back_on_typos() {
+        assert_eq!(parse_paste_method("type"), PasteMethod::Type);
+        assert_eq!(parse_paste_method(" Typing "), PasteMethod::Type);
+        assert_eq!(parse_paste_method("shortcut"), PasteMethod::Shortcut);
+        assert_eq!(parse_paste_method(""), PasteMethod::Shortcut);
+        assert_eq!(parse_paste_method("tpye"), PasteMethod::Shortcut);
+        assert_eq!(parse_paste_method("applescript"), PasteMethod::AppleScript);
+        assert_eq!(parse_paste_method("clipboard"), PasteMethod::Clipboard);
+        assert_eq!(parse_paste_method("COPY-ONLY"), PasteMethod::Clipboard);
     }
 }

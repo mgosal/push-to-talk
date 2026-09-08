@@ -1,7 +1,7 @@
 //! IPC via Unix domain socket + CLI argument handling.
 //!
 //! The running app listens on a Unix socket (default `/tmp/ptt.sock`).
-//! CLI clients can send `toggle` and `status` commands.
+//! CLI clients can send `toggle`, `status`, `setup` and `quit` commands.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -12,6 +12,11 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcCommand {
     Toggle,
+    /// Open the Setup window. Reaches settings when the menubar item is not
+    /// visible, which would otherwise leave the app entirely unreachable.
+    Setup,
+    /// Quit the app.
+    Quit,
 }
 
 /// Snapshot of app state published by the main thread so the IPC server can
@@ -54,14 +59,42 @@ pub enum CliAction {
     Toggle,
     /// Query --status from a running instance.
     Status,
+    /// Ask a running instance to open its Setup window.
+    Setup,
+    /// Ask a running instance to quit.
+    Quit,
+    /// Print the most recent transcript and copy it to the clipboard.
+    /// Reads the database directly, so it works whether or not the app runs.
+    Last,
+    /// Write a hand-editable evaluation set to a file.
+    ExportDataset(PathBuf),
+    /// Read corrections back from an edited evaluation set.
+    ImportCorrections(PathBuf),
+    /// Score an edited evaluation file: every reviewed sample counts,
+    /// whether or not it needed correcting.
+    Score(Option<PathBuf>),
 }
 
-/// Parse CLI arguments. Minimal hand-rolled parser — no clap needed for 2 flags.
+/// Parse CLI arguments. Minimal hand-rolled parser — no clap needed.
 pub fn parse_args() -> CliAction {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("--toggle") => CliAction::Toggle,
         Some("--status") => CliAction::Status,
+        Some("--setup") => CliAction::Setup,
+        Some("--quit") => CliAction::Quit,
+        Some("--last") => CliAction::Last,
+        Some("--export-dataset") => CliAction::ExportDataset(
+            args.get(1).map(PathBuf::from).unwrap_or_else(|| "transcription-eval.md".into()),
+        ),
+        Some("--import-corrections") => match args.get(1) {
+            Some(p) => CliAction::ImportCorrections(PathBuf::from(p)),
+            None => {
+                eprintln!("--import-corrections needs a file path");
+                std::process::exit(1);
+            }
+        },
+        Some("--score") => CliAction::Score(args.get(1).map(PathBuf::from)),
         _ => CliAction::RunApp,
     }
 }
@@ -190,6 +223,18 @@ pub fn start_server(socket_path: &Path) -> Arc<Mutex<IpcState>> {
                                 "toggle" => {
                                     if let Ok(mut s) = state_clone.lock() {
                                         s.commands.push(IpcCommand::Toggle);
+                                    }
+                                    let _ = stream.write_all(b"ok\n");
+                                }
+                                "setup" => {
+                                    if let Ok(mut s) = state_clone.lock() {
+                                        s.commands.push(IpcCommand::Setup);
+                                    }
+                                    let _ = stream.write_all(b"ok\n");
+                                }
+                                "quit" => {
+                                    if let Ok(mut s) = state_clone.lock() {
+                                        s.commands.push(IpcCommand::Quit);
                                     }
                                     let _ = stream.write_all(b"ok\n");
                                 }

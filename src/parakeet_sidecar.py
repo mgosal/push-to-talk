@@ -90,12 +90,25 @@ def main():
         try:
             request = json.loads(line)
             audio_path = request["audio"]
+            chunk_duration_s = request.get("chunk_duration_s")
+            chunk_overlap_s = request.get("chunk_overlap_s", 15.0)
         except Exception as e:  # noqa: BLE001
             emit({"ok": False, "error": "bad request: {}".format(e)})
             continue
 
         try:
-            result = model.transcribe(audio_path)
+            # Unchunked, the TDT decoder silently drops the tail of long
+            # recordings instead of erroring — it just stops emitting tokens
+            # partway through. chunk_duration splits audio longer than that
+            # into overlapping windows and stitches the results back
+            # together; parakeet-mlx processes the file in one pass anyway
+            # when it's shorter than chunk_duration, so it's safe to always
+            # pass this through.
+            result = model.transcribe(
+                audio_path,
+                chunk_duration=chunk_duration_s,
+                overlap_duration=chunk_overlap_s,
+            )
             # Parakeet is a transducer: silence yields empty text rather than
             # invented speech. Pass that through as-is; the caller decides.
             text = (getattr(result, "text", "") or "").strip()

@@ -32,6 +32,18 @@ retry_backoff = [1, 3, 5]
 # Minimum recording duration (seconds). Shorter = discard.
 min_duration_s = 0.4
 
+[paste]
+# How the transcript reaches the focused app.
+#   "shortcut" — set the clipboard and send ⌘V. Fast, and correct almost
+#                everywhere. This is the default.
+#   "type"     — type the transcript directly, one character at a time, with no
+#                modifier key involved. Slower. Useful for local apps that
+#                ignore ⌘V, but it does NOT help remote desktop sessions: those
+#                forward the raw keycode and ignore the attached Unicode
+#                character, so every character arrives as "a" (keycode 0).
+#                The clipboard is set either way.
+method = "shortcut"
+
 [transcription]
 # Which engine transcribes recordings:
 #   "api"   — OpenAI-compatible HTTP API (default). Needs a key and a network.

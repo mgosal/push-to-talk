@@ -227,6 +227,8 @@ fn request(
     sidecar: &mut Sidecar,
     audio_path: &Path,
     timeout_s: f64,
+    chunk_duration_s: f64,
+    chunk_overlap_s: f64,
 ) -> Result<String, RequestError> {
     let path = audio_path.to_str().ok_or_else(|| {
         RequestError::Rejected(format!(
@@ -234,7 +236,12 @@ fn request(
             audio_path.display()
         ))
     })?;
-    let line = serde_json::json!({ "audio": path }).to_string();
+    let line = serde_json::json!({
+        "audio": path,
+        "chunk_duration_s": chunk_duration_s,
+        "chunk_overlap_s": chunk_overlap_s,
+    })
+    .to_string();
 
     // A write failure means the sidecar is gone (typically a broken pipe).
     writeln!(sidecar.stdin, "{line}")
@@ -279,8 +286,24 @@ pub fn transcribe(cfg: &LocalConfig, audio_path: &Path) -> Result<TranscriptionR
         // pay the same timeout twice.
         let sidecar = ensure_started(&mut slot, cfg)?;
 
-        match request(sidecar, audio_path, cfg.request_timeout_s) {
-            Ok(text) => return Ok(crate::transcribe::build_result(text, start, audio_path)),
+        match request(
+            sidecar,
+            audio_path,
+            cfg.request_timeout_s,
+            cfg.chunk_duration_s,
+            cfg.chunk_overlap_s,
+        ) {
+            Ok(text) => {
+                // A decode that came back as mostly <unk> is transient: the
+                // same file has been observed transcribing correctly on a
+                // second attempt. Retry once here rather than handing the user
+                // garbage, or making them re-record something they already said.
+                if crate::transcribe::is_failed_decode(&text) && attempt == 0 {
+                    eprintln!("[ptt] Decode came back as mostly <unk> — retrying once");
+                    continue;
+                }
+                return Ok(crate::transcribe::build_result(text, start, audio_path));
+            }
             Err(RequestError::Rejected(e)) => return Err(e),
             Err(RequestError::Broken(e)) => {
                 last_error = e;
@@ -339,7 +362,7 @@ class _Result:
     def __init__(self, text): self.text = text
 
 class _Model:
-    def transcribe(self, path):
+    def transcribe(self, path, chunk_duration=None, overlap_duration=15.0):
         if "silence" in path: return _Result("   ")
         if "boom" in path: raise RuntimeError("decode failed")
         return _Result("  hello from the stub  ")
@@ -384,6 +407,8 @@ def from_pretrained(model_id):
             ready_timeout_s: 30.0,
             request_timeout_s: 30.0,
             warm_up: false,
+            chunk_duration_s: 60.0,
+            chunk_overlap_s: 15.0,
         };
         (dir, cfg)
     }
@@ -399,25 +424,25 @@ def from_pretrained(model_id):
 
         // Transcripts come back trimmed.
         assert_eq!(
-            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0).unwrap(),
+            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0, 60.0, 15.0).unwrap(),
             "hello from the stub"
         );
         // Silence yields empty text, not invented speech — and not an error.
         assert_eq!(
-            request(&mut sidecar, Path::new("/tmp/silence.wav"), 30.0).unwrap(),
+            request(&mut sidecar, Path::new("/tmp/silence.wav"), 30.0, 60.0, 15.0).unwrap(),
             ""
         );
         // A per-request failure is reported as Rejected, so the caller keeps
         // the sidecar and its loaded model...
         let Err(RequestError::Rejected(err)) =
-            request(&mut sidecar, Path::new("/tmp/boom.wav"), 30.0)
+            request(&mut sidecar, Path::new("/tmp/boom.wav"), 30.0, 60.0, 15.0)
         else {
             panic!("a model-reported failure must not be treated as a broken sidecar");
         };
         assert!(err.contains("decode failed"), "unexpected error: {err}");
         // ...so the next request still works.
         assert_eq!(
-            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0).unwrap(),
+            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0, 60.0, 15.0).unwrap(),
             "hello from the stub"
         );
 
@@ -458,7 +483,7 @@ def from_pretrained(model_id):
         // timing; either way it must come back as Broken rather than block
         // forever, so the caller respawns.
         let Err(RequestError::Broken(err)) =
-            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0)
+            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0, 60.0, 15.0)
         else {
             panic!("a dead sidecar must be reported as broken");
         };
