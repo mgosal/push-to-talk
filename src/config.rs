@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub api: ApiConfig,
     pub audio: AudioConfig,
+    pub paste: PasteConfig,
     pub transcription: TranscriptionConfig,
     pub storage: StorageConfig,
     pub ui: UiConfig,
@@ -45,13 +46,96 @@ pub struct AudioConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
+pub struct PasteConfig {
+    /// How the transcript reaches the focused app: `"shortcut"` or `"type"`.
+    pub method: String,
+}
+
+/// How a transcript is delivered to the focused application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteMethod {
+    /// Put the text on the clipboard and send ⌘V as Core Graphics events.
+    Shortcut,
+    /// Type the text as Unicode key events. Needs no modifier, but remote
+    /// desktop sessions forward the raw keycode and drop the Unicode payload,
+    /// so every character arrives as "a" there. Local use only.
+    Type,
+    /// Put the text on the clipboard and ask System Events to press ⌘V.
+    /// Routed through the Accessibility API rather than synthesised directly,
+    /// which some applications honour when Core Graphics events are ignored.
+    AppleScript,
+    /// Put the text on the clipboard and stop. Nothing is injected, so this
+    /// works everywhere; the user presses ⌘V themselves. The reliable choice
+    /// for remote desktop sessions, which discard synthetic modifiers.
+    Clipboard,
+}
+
+/// Parse the `[paste] method` value, defaulting to the shortcut on a typo.
+pub fn parse_paste_method(value: &str) -> PasteMethod {
+    match value.trim().to_lowercase().as_str() {
+        "type" | "typing" | "keystrokes" => PasteMethod::Type,
+        "applescript" | "system-events" | "osascript" => PasteMethod::AppleScript,
+        "clipboard" | "copy" | "copy-only" => PasteMethod::Clipboard,
+        "shortcut" | "paste" | "" => PasteMethod::Shortcut,
+        other => {
+            eprintln!("[ptt] Unknown paste method \"{other}\" — using \"shortcut\"");
+            PasteMethod::Shortcut
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(default)]
 pub struct TranscriptionConfig {
+    /// Which transcription backend to use: `"api"` or `"local"`.
+    /// Unknown values fall back to `"api"` with a warning.
+    pub backend: String,
     /// Path to a speaker profile file for transcription priming.
     pub speaker_profile: Option<String>,
     /// Maximum words-per-second threshold. Above this → hallucination.
     pub max_wps: f64,
     /// Directory for saved transcript markdown files.
     pub transcripts_dir: Option<String>,
+    /// Settings for the local (offline) backend. Ignored when `backend = "api"`.
+    pub local: LocalConfig,
+}
+
+/// Which engine transcribes a recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// The OpenAI-compatible HTTP API. Requires a key and a network.
+    Api,
+    /// A local Parakeet model via the warm sidecar. Falls back to [`Backend::Api`]
+    /// when the sidecar cannot be started.
+    Local,
+}
+
+/// Settings for the local Parakeet backend.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LocalConfig {
+    /// Launcher for the sidecar. The script path and model id are appended,
+    /// so this can be a bare interpreter (`["python3"]`) or a wrapper such as
+    /// `["uv", "run", "--with", "parakeet-mlx", "python"]`.
+    pub command: Vec<String>,
+    /// Hugging Face model id passed to `parakeet-mlx`.
+    pub model: String,
+    /// How long to wait for the model to load. The first launch downloads
+    /// weights, which is why this is generous.
+    pub ready_timeout_s: f64,
+    /// How long to wait for a single transcription.
+    pub request_timeout_s: f64,
+    /// Load the model at app launch rather than on the first dictation.
+    pub warm_up: bool,
+    /// Split recordings longer than this (seconds) into overlapping chunks
+    /// before decoding. The TDT decoder is run unchunked below this length;
+    /// past it, unchunked decoding silently drops the tail of the audio
+    /// instead of erroring, so long dictations need chunking to come back
+    /// complete.
+    pub chunk_duration_s: f64,
+    /// Overlap between consecutive chunks, in seconds. Only used once a
+    /// recording exceeds `chunk_duration_s`.
+    pub chunk_overlap_s: f64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -101,12 +185,38 @@ impl Default for AudioConfig {
     }
 }
 
+impl Default for PasteConfig {
+    fn default() -> Self {
+        Self { method: "shortcut".into() }
+    }
+}
+
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
+            backend: "api".into(),
             speaker_profile: None,
             max_wps: 5.0,
             transcripts_dir: None,
+            local: LocalConfig::default(),
+        }
+    }
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            command: vec!["python3".into()],
+            model: "mlx-community/parakeet-tdt-0.6b-v3".into(),
+            // A cold start downloads ~2.5 GB of weights once.
+            ready_timeout_s: 600.0,
+            // Chunked decoding of a long recording is still one request, but
+            // it now takes longer than a short one to come back — leave
+            // headroom above the chunking threshold below.
+            request_timeout_s: 300.0,
+            warm_up: true,
+            chunk_duration_s: 60.0,
+            chunk_overlap_s: 15.0,
         }
     }
 }
@@ -280,6 +390,26 @@ pub fn text_model_for(model: &str) -> String {
     }
 }
 
+/// Save the selected transcription backend to config.toml.
+pub fn save_backend(backend: Backend) -> Result<(), String> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create config directory: {e}"))?;
+
+    let mut cfg = load();
+    cfg.transcription.backend = match backend {
+        Backend::Local => "local".into(),
+        Backend::Api => "api".into(),
+    };
+
+    let config_text = toml::to_string_pretty(&cfg)
+        .map_err(|e| format!("failed to serialise config: {e}"))?;
+    std::fs::write(dir.join("config.toml"), config_text)
+        .map_err(|e| format!("failed to write config: {e}"))?;
+
+    Ok(())
+}
+
 /// Save the notifications enabled/disabled setting to config.toml.
 pub fn save_notifications(enabled: bool) -> Result<(), String> {
     let dir = config_dir();
@@ -388,6 +518,16 @@ impl Config {
         })
     }
 
+    /// Resolve how transcripts should be delivered to the focused app.
+    pub fn paste_method(&self) -> PasteMethod {
+        parse_paste_method(&self.paste.method)
+    }
+
+    /// Resolve the configured transcription backend.
+    pub fn backend(&self) -> Backend {
+        parse_backend(&self.transcription.backend)
+    }
+
     /// Resolve the PID file path.
     pub fn pid_path(&self) -> PathBuf {
         resolve_path(&self.storage.pid_file)
@@ -398,6 +538,27 @@ impl Config {
         resolve_path(&self.storage.socket_path)
     }
 
+}
+
+/// Trim a model id to something that fits in a menu: the last path segment,
+/// so "mlx-community/parakeet-tdt-0.6b-v3" reads as "parakeet-tdt-0.6b-v3".
+pub fn short_model_name(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// Parse the `[transcription] backend` value.
+///
+/// A typo shouldn't silently disable dictation, so anything unrecognised
+/// falls back to the API backend and says so.
+pub fn parse_backend(value: &str) -> Backend {
+    match value.trim().to_lowercase().as_str() {
+        "local" | "parakeet" => Backend::Local,
+        "api" | "" => Backend::Api,
+        other => {
+            eprintln!("[ptt] Unknown transcription backend \"{other}\" — using \"api\"");
+            Backend::Api
+        }
+    }
 }
 
 /// Resolve a path string: expand `~`, resolve relative to config dir.
@@ -421,7 +582,9 @@ fn resolve_path(p: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        text_model_for, transcription_endpoint, transcription_model, uses_transcription_endpoint,
+        parse_backend, parse_paste_method, short_model_name, text_model_for,
+        transcription_endpoint, transcription_model, uses_transcription_endpoint, Backend,
+        PasteMethod, TranscriptionConfig,
     };
 
     #[test]
@@ -463,5 +626,55 @@ mod tests {
         assert!(uses_transcription_endpoint("gpt-4o-transcribe"));
         assert!(uses_transcription_endpoint("openai/gpt-4o-audio-preview"));
         assert!(!uses_transcription_endpoint("gpt-audio"));
+    }
+
+    #[test]
+    fn parses_backend_values_and_falls_back_on_typos() {
+        assert_eq!(parse_backend("local"), Backend::Local);
+        assert_eq!(parse_backend("  Local "), Backend::Local);
+        assert_eq!(parse_backend("parakeet"), Backend::Local);
+        assert_eq!(parse_backend("api"), Backend::Api);
+        assert_eq!(parse_backend(""), Backend::Api);
+        assert_eq!(parse_backend("locl"), Backend::Api);
+    }
+
+    #[test]
+    fn defaults_to_the_api_backend() {
+        let cfg = TranscriptionConfig::default();
+        assert_eq!(parse_backend(&cfg.backend), Backend::Api);
+        assert!(cfg.local.warm_up);
+        assert_eq!(cfg.local.command, vec!["python3".to_string()]);
+    }
+
+    #[test]
+    fn transcription_config_round_trips_through_toml() {
+        // `local` is a table, so it must serialise after every scalar field —
+        // otherwise toml emits "values must be emitted before tables".
+        let text = toml::to_string_pretty(&TranscriptionConfig::default()).unwrap();
+        let parsed: TranscriptionConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.backend, "api");
+        assert_eq!(parsed.local.model, TranscriptionConfig::default().local.model);
+    }
+
+    #[test]
+    fn shortens_model_ids_for_display() {
+        assert_eq!(
+            short_model_name("mlx-community/parakeet-tdt-0.6b-v3"),
+            "parakeet-tdt-0.6b-v3"
+        );
+        assert_eq!(short_model_name("gpt-4o-transcribe"), "gpt-4o-transcribe");
+        assert_eq!(short_model_name("openai/gpt-4o-transcribe"), "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn parses_paste_methods_and_falls_back_on_typos() {
+        assert_eq!(parse_paste_method("type"), PasteMethod::Type);
+        assert_eq!(parse_paste_method(" Typing "), PasteMethod::Type);
+        assert_eq!(parse_paste_method("shortcut"), PasteMethod::Shortcut);
+        assert_eq!(parse_paste_method(""), PasteMethod::Shortcut);
+        assert_eq!(parse_paste_method("tpye"), PasteMethod::Shortcut);
+        assert_eq!(parse_paste_method("applescript"), PasteMethod::AppleScript);
+        assert_eq!(parse_paste_method("clipboard"), PasteMethod::Clipboard);
+        assert_eq!(parse_paste_method("COPY-ONLY"), PasteMethod::Clipboard);
     }
 }

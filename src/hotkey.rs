@@ -5,15 +5,26 @@
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// A press shorter than this, with no other key involved, is a tap rather than
+/// a dictation. It matches the default `audio.min_duration_s`, so a press is
+/// either long enough to be speech or short enough to be a tap — never wasted.
+const TAP_MAX: Duration = Duration::from_millis(400);
 
 /// Hotkey events sent from the event tap thread.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HotkeyEvent {
     PushDown,
     PushUp,
-    /// Left arrow pressed while right Option is held.
-    /// Main thread decides whether to engage locked mode based on app state.
-    LeftArrowDown,
+    /// Right Option pressed and released quickly, with no other key involved.
+    /// The main thread turns this into locked (hands-free) dictation.
+    ///
+    /// This replaced Option+Left Arrow, which could not work properly: the
+    /// event tap is listen-only and cannot swallow a keystroke, so the arrow
+    /// always reached the focused app and moved the caret. A bare Option tap
+    /// types nothing, so there is nothing to swallow.
+    Tap,
     /// Escape pressed (any time). Main thread uses this to exit locked mode
     /// without discarding the transcript.
     EscapePressed,
@@ -23,6 +34,12 @@ pub enum HotkeyEvent {
 pub struct HotkeyState {
     pub events: Vec<HotkeyEvent>,
     pub option_held: bool,
+    /// When the current Option press began, for telling a tap from a hold.
+    press_started: Option<Instant>,
+    /// Whether another key was pressed while Option was held. Right Option is
+    /// also the accent modifier — ⌥e, ⌥u, ⌥3 — and those look exactly like a
+    /// tap in timing alone. Anything with a second key is never a tap.
+    other_key_during_hold: bool,
 }
 
 impl HotkeyState {
@@ -30,11 +47,19 @@ impl HotkeyState {
         Self {
             events: Vec::new(),
             option_held: false,
+            press_started: None,
+            other_key_during_hold: false,
         }
     }
 
     pub fn drain_events(&mut self) -> Vec<HotkeyEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Whether the press that just ended should count as a tap.
+    fn was_tap(&self) -> bool {
+        !self.other_key_during_hold
+            && self.press_started.is_some_and(|t| t.elapsed() < TAP_MAX)
     }
 }
 
@@ -161,7 +186,6 @@ const K_CG_EVENT_KEY_DOWN: u32 = 10;
 const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 
 // Key codes
-const LEFT_ARROW_KEYCODE: i64 = 123;
 const ESCAPE_KEYCODE: i64 = 53;
 
 // Right Option key flag (NX_DEVICERALTKEYMASK)
@@ -188,29 +212,33 @@ extern "C" fn event_callback(
             if let Ok(mut s) = state.lock() {
                 if right_opt_down && !s.option_held {
                     s.option_held = true;
+                    s.press_started = Some(Instant::now());
+                    s.other_key_during_hold = false;
                     s.events.push(HotkeyEvent::PushDown);
                     eprintln!("[ptt] ▶ Push down (flags=0x{flags:x})");
                 } else if !right_opt_down && s.option_held {
                     s.option_held = false;
-                    s.events.push(HotkeyEvent::PushUp);
-                    eprintln!("[ptt] ■ Push up (flags=0x{flags:x})");
+                    let tap = s.was_tap();
+                    s.press_started = None;
+                    if tap {
+                        s.events.push(HotkeyEvent::Tap);
+                        eprintln!("[ptt] ⇥ Tap (right ⌥)");
+                    } else {
+                        s.events.push(HotkeyEvent::PushUp);
+                        eprintln!("[ptt] ■ Push up (flags=0x{flags:x})");
+                    }
                 }
             }
         }
         K_CG_EVENT_KEY_DOWN => {
             let keycode = unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
-            if keycode == LEFT_ARROW_KEYCODE {
-                if let Ok(s) = state.lock() {
-                    if s.option_held {
-                        drop(s);
-                        if let Ok(mut s) = state.lock() {
-                            s.events.push(HotkeyEvent::LeftArrowDown);
-                            eprintln!("[ptt] ⇠ Left arrow (opt held)");
-                        }
-                    }
+            if let Ok(mut s) = state.lock() {
+                // Any key struck during the hold disqualifies it as a tap, so
+                // typing an accented character never starts locked dictation.
+                if s.option_held {
+                    s.other_key_during_hold = true;
                 }
-            } else if keycode == ESCAPE_KEYCODE {
-                if let Ok(mut s) = state.lock() {
+                if keycode == ESCAPE_KEYCODE {
                     s.events.push(HotkeyEvent::EscapePressed);
                     eprintln!("[ptt] ⎋ Escape pressed");
                 }
@@ -260,11 +288,46 @@ pub fn start_monitor() -> Arc<Mutex<HotkeyState>> {
                 CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode);
                 CGEventTapEnable(tap, true);
 
-                eprintln!("[ptt] Hotkey monitor active (right Option = push-to-talk, +left arrow = lock)");
+                eprintln!("[ptt] Hotkey monitor active (hold right ⌥ = dictate, tap = lock)");
                 CFRunLoopRun(); // blocks forever
             }
         })
         .expect("Failed to spawn hotkey thread");
 
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_after_press(held_for: Duration, other_key: bool) -> HotkeyState {
+        let mut s = HotkeyState::new();
+        s.option_held = true;
+        s.press_started = Some(Instant::now() - held_for);
+        s.other_key_during_hold = other_key;
+        s
+    }
+
+    #[test]
+    fn a_quick_press_alone_is_a_tap() {
+        assert!(state_after_press(Duration::from_millis(120), false).was_tap());
+    }
+
+    #[test]
+    fn holding_to_dictate_is_not_a_tap() {
+        assert!(!state_after_press(Duration::from_millis(1500), false).was_tap());
+    }
+
+    #[test]
+    fn typing_an_accent_is_not_a_tap() {
+        // ⌥e is quick, but a second key was involved — locking here would
+        // hijack every accented character the user types.
+        assert!(!state_after_press(Duration::from_millis(120), true).was_tap());
+    }
+
+    #[test]
+    fn a_press_that_never_started_is_not_a_tap() {
+        assert!(!HotkeyState::new().was_tap());
+    }
 }

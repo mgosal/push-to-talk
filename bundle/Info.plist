@@ -15,10 +15,10 @@
     <string>push-to-talk</string>
 
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
 
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
 
     <key>CFBundlePackageType</key>
     <string>APPL</string>
@@ -38,5 +38,11 @@
 
     <key>NSMicrophoneUsageDescription</key>
     <string>Push to Talk records audio for voice transcription.</string>
+
+    <!-- Needed only by [paste] method = "applescript", which asks System
+         Events to press Cmd+V. Without this key the Apple Events prompt is
+         generic and the request can fail silently. -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Push to Talk asks System Events to press Cmd+V so it can paste your dictation into the app you are using.</string>
 </dict>
 </plist>

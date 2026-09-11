@@ -15,3 +15,10 @@ config.toml
 speaker-profile.md
 transcripts/
 *.zip
+# Evaluation sets contain verbatim dictation — never commit them.
+# Matched by shape, not by one exact name, so a differently-named export
+# cannot slip through.
+transcription-eval*.md
+*groundtruth*.md
+*.eval.md
+eval-*.md

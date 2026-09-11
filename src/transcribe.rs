@@ -78,9 +78,67 @@ pub fn is_wps_hallucination(text: &str, duration_s: f64, max_wps: f64) -> bool {
     words / duration_s > max_wps
 }
 
-/// Combined hallucination check (format + WPS).
-pub fn is_hallucination(text: &str, duration_s: f64, max_wps: f64) -> bool {
-    is_format_hallucination(text).is_some() || is_wps_hallucination(text, duration_s, max_wps)
+/// Fraction of unknown tokens above which a transcript is treated as garbage.
+const MAX_UNK_RATIO: f64 = 0.25;
+
+/// Whether a transcript is mostly unknown tokens.
+///
+/// A transducer emits `<unk>` when it cannot map audio to any token. A few are
+/// normal in noisy speech; a transcript that is largely `<unk>` is a failed
+/// decode. This was observed in the wild — 19s of clear speech came back as
+/// nothing but `<unk>` and was recorded as a success, then transcribed
+/// correctly from the same file moments later, so the failure is transient and
+/// worth retrying rather than surfacing.
+pub fn unk_ratio(text: &str) -> f64 {
+    let tokens = text.split_whitespace().count();
+    if tokens == 0 {
+        return 0.0;
+    }
+    let unk = text.matches("<unk>").count();
+    // <unk> runs together without spaces, so count against the larger of the
+    // two: whitespace tokens, or the number of <unk> markers found.
+    unk as f64 / tokens.max(unk) as f64
+}
+
+/// Whether this transcript looks like a failed decode that a retry may fix.
+pub fn is_failed_decode(text: &str) -> bool {
+    unk_ratio(text) > MAX_UNK_RATIO
+}
+
+/// Run the hallucination guards that apply to `backend`, returning the reason
+/// a transcript should be rejected.
+///
+/// The format and assistant-style checks only make sense for the API backend.
+/// Those failures are an LLM answering the audio instead of transcribing it;
+/// a transducer has no text decoder to do that with, so running them on local
+/// output can only produce false positives on speech that happens to begin
+/// with "Sure," or to contain a quoted brace. The words-per-second check
+/// applies to both — for the API it catches invention, and for a transducer it
+/// catches a repetition loop.
+pub fn hallucination_reason(
+    text: &str,
+    duration_s: f64,
+    max_wps: f64,
+    backend: crate::config::Backend,
+) -> Option<String> {
+    // Applies to any backend: a transcript that is mostly unknown tokens is
+    // garbage whoever produced it, and must never reach the clipboard.
+    if is_failed_decode(text) {
+        return Some(format!(
+            "{:.0}% unknown tokens — failed decode",
+            unk_ratio(text) * 100.0
+        ));
+    }
+    if backend == crate::config::Backend::Api {
+        if let Some(reason) = is_format_hallucination(text) {
+            return Some(reason.to_string());
+        }
+    }
+    if is_wps_hallucination(text, duration_s, max_wps) {
+        let wps = text.split_whitespace().count() as f64 / duration_s;
+        return Some(format!("{wps:.1} words/sec over the {max_wps:.1} limit"));
+    }
+    None
 }
 
 /// Transcription result.
@@ -89,6 +147,21 @@ pub struct TranscriptionResult {
     pub latency_s: f64,
     pub wps: f64,
     pub duration_s: f64,
+}
+
+/// Assemble a [`TranscriptionResult`], deriving latency from `start` and
+/// words-per-second from the recording's own duration. Shared by every
+/// backend so the hallucination guard and history stats stay comparable.
+pub fn build_result(
+    text: String,
+    start: std::time::Instant,
+    audio_path: &Path,
+) -> TranscriptionResult {
+    let latency_s = start.elapsed().as_secs_f64();
+    let duration_s = crate::audio::get_duration(audio_path).unwrap_or(0.0);
+    let word_count = text.split_whitespace().count() as f64;
+    let wps = if duration_s > 0.0 { word_count / duration_s } else { 0.0 };
+    TranscriptionResult { text, latency_s, wps, duration_s }
 }
 
 /// Build the system prompt for transcription.
@@ -294,19 +367,7 @@ fn transcribe_with_chat_endpoint(
             .trim()
             .to_string();
 
-        let latency_s = start.elapsed().as_secs_f64();
-
-        // Get audio duration for WPS calc
-        let duration_s = crate::audio::get_duration(audio_path).unwrap_or(0.0);
-        let word_count = text.split_whitespace().count() as f64;
-        let wps = if duration_s > 0.0 { word_count / duration_s } else { 0.0 };
-
-        return Ok(TranscriptionResult {
-            text,
-            latency_s,
-            wps,
-            duration_s,
-        });
+        return Ok(build_result(text, start, audio_path));
     }
 
     Err(last_error)
@@ -389,17 +450,7 @@ fn transcribe_with_audio_endpoint(
             serde_json::from_str(&resp_text).map_err(|e| format!("JSON parse error: {e}"))?;
         let text = parse_transcription_text(&resp_json).unwrap_or_default();
 
-        let latency_s = start.elapsed().as_secs_f64();
-        let duration_s = crate::audio::get_duration(audio_path).unwrap_or(0.0);
-        let word_count = text.split_whitespace().count() as f64;
-        let wps = if duration_s > 0.0 { word_count / duration_s } else { 0.0 };
-
-        return Ok(TranscriptionResult {
-            text,
-            latency_s,
-            wps,
-            duration_s,
-        });
+        return Ok(build_result(text, start, audio_path));
     }
 
     Err(last_error)
@@ -431,6 +482,53 @@ mod tests {
             is_format_hallucination("As an AI, I cannot assist with that."),
             Some("looks like assistant response")
         );
+    }
+
+    #[test]
+    fn detects_a_transcript_that_is_mostly_unknown_tokens() {
+        // The real failure: 19s of speech decoded as nothing but <unk>.
+        assert!(is_failed_decode("<unk><unk><unk><unk><unk><unk><unk><unk>"));
+        assert!(is_failed_decode("<unk> <unk> <unk> hello"));
+    }
+
+    #[test]
+    fn tolerates_the_odd_unknown_token_in_real_speech() {
+        let speech = "so the ignition sequence pattern is what we want here <unk> I think";
+        assert!(!is_failed_decode(speech), "ratio was {}", unk_ratio(speech));
+        assert!(!is_failed_decode("perfectly ordinary speech with no unknowns"));
+        assert!(!is_failed_decode(""));
+    }
+
+    #[test]
+    fn format_guards_apply_only_to_the_api_backend() {
+        use crate::config::Backend;
+        let answered = "Sure, here's the transcript you asked for.";
+
+        // The API can answer the audio instead of transcribing it.
+        assert!(hallucination_reason(answered, 10.0, 5.0, Backend::Api).is_some());
+        // Parakeet structurally cannot, so the same text from it is real speech.
+        assert_eq!(hallucination_reason(answered, 10.0, 5.0, Backend::Local), None);
+    }
+
+    #[test]
+    fn wps_guard_applies_to_both_backends() {
+        use crate::config::Backend;
+        // A transducer repetition loop looks like this: many words, no time.
+        let looped = "the the the the the the the the the the";
+        for backend in [Backend::Api, Backend::Local] {
+            let reason = hallucination_reason(looped, 1.0, 5.0, backend)
+                .expect("10 words in 1s must trip the guard");
+            assert!(reason.contains("words/sec"), "unexpected reason: {reason}");
+        }
+    }
+
+    #[test]
+    fn real_speech_passes_both_backends() {
+        use crate::config::Backend;
+        let speech = "Okay, I don't see the option in the settings for the local model.";
+        for backend in [Backend::Api, Backend::Local] {
+            assert_eq!(hallucination_reason(speech, 4.6, 5.0, backend), None);
+        }
     }
 
     #[test]
