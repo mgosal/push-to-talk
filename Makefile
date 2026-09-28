@@ -3,10 +3,13 @@ BUNDLE     := $(APP_NAME).app
 BINARY     := push-to-talk
 IDENTIFIER := com.mgosal.push-to-talk
 INSTALL_DIR := /Applications
+# Created once by `make signing-cert`. Without it the bundle is ad-hoc signed,
+# and macOS forgets its Accessibility and Microphone grants on every rebuild.
+SIGN_IDENTITY := Push to Talk Local Signing
 MACOSX_DEPLOYMENT_TARGET := 14.0
 export MACOSX_DEPLOYMENT_TARGET
 
-.PHONY: check test build bundle install uninstall clean
+.PHONY: check test build bundle install uninstall clean signing-cert
 
 # ── Build ──────────────────────────────────────────────────────────────
 
@@ -30,9 +33,19 @@ bundle: build
 	@if [ -f bundle/AppIcon.icns ]; then \
 		cp bundle/AppIcon.icns "$(BUNDLE)/Contents/Resources/"; \
 	fi
-	@# Ad-hoc sign so macOS gives it a stable identity for TCC
-	@codesign --force --sign - --deep "$(BUNDLE)"
-	@echo "✓ $(BUNDLE) ready (ad-hoc signed)"
+	@# A certificate signature keeps the same identity across rebuilds, so
+	@# privacy grants survive; an ad-hoc one is tied to this exact binary.
+	@if security find-certificate -c "$(SIGN_IDENTITY)" >/dev/null 2>&1; then \
+		codesign --force --sign "$(SIGN_IDENTITY)" --identifier "$(IDENTIFIER)" "$(BUNDLE)" || exit 1; \
+		echo "✓ $(BUNDLE) ready (signed as \"$(SIGN_IDENTITY)\")"; \
+	else \
+		codesign --force --sign - --identifier "$(IDENTIFIER)" "$(BUNDLE)" || exit 1; \
+		echo "✓ $(BUNDLE) ready (ad-hoc signed — permissions reset on every rebuild;"; \
+		echo "  run 'make signing-cert' once to fix that)"; \
+	fi
+
+signing-cert:
+	@tools/create-signing-cert.sh "$(SIGN_IDENTITY)"
 
 # ── Install ────────────────────────────────────────────────────────────
 
