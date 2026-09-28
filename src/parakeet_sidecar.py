@@ -280,6 +280,37 @@ def load_model(model_id):
     return from_pretrained(model_id)
 
 
+# MLX keeps freed GPU buffers in a cache for reuse, and by default lets that
+# cache grow to the whole device memory limit. Every recording length needs
+# differently sized buffers, so the cache never gets a hit and just grows —
+# about half a gigabyte per dictation, reaching tens of gigabytes (all of it
+# pushed to swap) over a day, while the model itself only needs ~1.3 GB. Cap
+# the cache so a single long recording still reuses buffers across chunks,
+# and empty it after every request since the next one won't match anyway.
+BUFFER_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
+
+
+def _mlx():
+    """mlx.core, or None under a stub model that doesn't bring MLX along."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+    return mx
+
+
+def limit_buffer_cache():
+    mx = _mlx()
+    if mx is not None:
+        mx.set_cache_limit(BUFFER_CACHE_LIMIT_BYTES)
+
+
+def release_buffer_cache():
+    mx = _mlx()
+    if mx is not None:
+        mx.clear_cache()
+
+
 def main():
     model_id = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL
 
@@ -289,6 +320,7 @@ def main():
         emit({"ready": False, "error": compact_error(e)})
         return 1
 
+    limit_buffer_cache()
     emit({"ready": True, "model": model_id})
 
     for line in sys.stdin:
@@ -339,6 +371,8 @@ def main():
             emit({"ok": True, "text": text, "sentences": sentences})
         except Exception as e:  # noqa: BLE001
             emit({"ok": False, "error": compact_error(e)})
+        finally:
+            release_buffer_cache()
 
     return 0
 
