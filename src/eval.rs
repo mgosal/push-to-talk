@@ -16,6 +16,10 @@ pub struct Sample {
     pub duration_s: Option<f64>,
     pub raw: String,
     pub corrected: Option<String>,
+    pub audio_path: Option<String>,
+    /// Sentence-level timing as a JSON array, when the local backend
+    /// produced this sample — lets a correction tool seek audio per sentence.
+    pub sentences_json: Option<String>,
 }
 
 // ── Scoring ───────────────────────────────────────────────────────────
@@ -124,52 +128,90 @@ const HEADER: &str = "\
 ";
 
 /// Render samples as a hand-editable document.
+///
+/// `audio:` and `sentences:` are `#`-prefixed like the header, so a human
+/// editor sees only the header's comment convention and the importer's line
+/// parser skips them for the same reason it skips the header: it only ever
+/// looks for `## `, `raw:`, and `corrected:`. They exist for a correction
+/// tool that wants to play back the audio a block came from.
 pub fn export(samples: &[Sample]) -> String {
     let mut out = String::from(HEADER);
     for s in samples {
         let dur = s.duration_s.map(|d| format!("{d:.1}s")).unwrap_or_else(|| "?".into());
-        out.push_str(&format!("\n## {} | {} | {}\n\nraw:\n{}\n\ncorrected:\n{}\n",
-            s.id, s.timestamp, dur, s.raw.trim(),
+        out.push_str(&format!("\n## {} | {} | {}\n", s.id, s.timestamp, dur));
+        if let Some(audio) = &s.audio_path {
+            out.push_str(&format!("# audio: {audio}\n"));
+        }
+        if let Some(sentences) = &s.sentences_json {
+            out.push_str(&format!("# sentences: {sentences}\n"));
+        }
+        out.push_str(&format!("\nraw:\n{}\n\ncorrected:\n{}\n",
+            s.raw.trim(),
             s.corrected.as_deref().unwrap_or(&s.raw).trim()));
     }
     out
 }
 
-/// Parse an export into (id, raw, corrected) triples.
+/// One scored block: id, raw, corrected, and whether a correction tool
+/// marked it reviewed (`# reviewed: yes`).
+pub struct ScoredBlock {
+    /// Unused by scoring itself, but part of the parsed shape for a caller
+    /// that wants to report which block a word-error came from.
+    #[allow(dead_code)]
+    pub id: i64,
+    pub raw: String,
+    pub corrected: String,
+    pub reviewed: bool,
+}
+
+/// Parse an export into scored blocks.
 ///
 /// Scoring reads the file rather than the database on purpose. Only *changed*
 /// blocks are stored as corrections, so scoring from the database would take
 /// the wrong denominator — it would measure error over the subset already
 /// known to be wrong, and report a terrible rate for a model that is mostly
 /// right. The file carries every reviewed sample, corrected or not.
-pub fn parse_scored(text: &str) -> Vec<(i64, String, String)> {
+///
+/// An untouched block (`corrected` equal to `raw`) is ambiguous on its own:
+/// it could mean "reviewed, and it was already right" or "never looked at
+/// yet". `# reviewed: yes` (written by the HTML correction viewer, never by
+/// hand-editing) disambiguates it. Filtering on that marker only kicks in
+/// once at least one block in the file carries it — a file with none, which
+/// is what hand-editing in a text editor produces, keeps scoring every block
+/// as before, so that workflow is untouched.
+pub fn parse_scored(text: &str) -> Vec<ScoredBlock> {
     let mut out = Vec::new();
     let mut id: Option<i64> = None;
     let mut section: Option<&str> = None;
+    let mut reviewed = false;
     let (mut raw, mut corrected): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
 
     fn flush(
         id: &mut Option<i64>,
         raw: &mut Vec<&str>,
         corrected: &mut Vec<&str>,
-        out: &mut Vec<(i64, String, String)>,
+        reviewed: &mut bool,
+        out: &mut Vec<ScoredBlock>,
     ) {
         if let Some(i) = id.take() {
             let r = raw.join("\n").trim().to_string();
             let c = corrected.join("\n").trim().to_string();
             if !r.is_empty() {
-                out.push((i, r, c));
+                out.push(ScoredBlock { id: i, raw: r, corrected: c, reviewed: *reviewed });
             }
         }
         raw.clear();
         corrected.clear();
+        *reviewed = false;
     }
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("## ") {
-            flush(&mut id, &mut raw, &mut corrected, &mut out);
+            flush(&mut id, &mut raw, &mut corrected, &mut reviewed, &mut out);
             section = None;
             id = rest.split('|').next().and_then(|s| s.trim().parse().ok());
+        } else if line.trim() == "# reviewed: yes" {
+            reviewed = true;
         } else if line.trim() == "raw:" {
             section = Some("raw");
         } else if line.trim() == "corrected:" {
@@ -182,7 +224,7 @@ pub fn parse_scored(text: &str) -> Vec<(i64, String, String)> {
             }
         }
     }
-    flush(&mut id, &mut raw, &mut corrected, &mut out);
+    flush(&mut id, &mut raw, &mut corrected, &mut reviewed, &mut out);
     out
 }
 
@@ -229,7 +271,7 @@ pub fn load_samples(db_path: &Path, limit: u32) -> Vec<Sample> {
         return vec![];
     };
     let Ok(mut stmt) = conn.prepare(
-        "SELECT id, timestamp, duration_s, transcript, corrected
+        "SELECT id, timestamp, duration_s, transcript, corrected, audio_path, sentences_json
          FROM dictations
          WHERE status = 'success' AND transcript IS NOT NULL AND length(trim(transcript)) > 0
          ORDER BY id DESC LIMIT ?1",
@@ -243,6 +285,8 @@ pub fn load_samples(db_path: &Path, limit: u32) -> Vec<Sample> {
             duration_s: row.get(2).ok(),
             raw: row.get::<_, String>(3)?,
             corrected: row.get::<_, Option<String>>(4)?,
+            audio_path: row.get::<_, Option<String>>(5)?,
+            sentences_json: row.get::<_, Option<String>>(6)?,
         })
     })
     .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -290,9 +334,34 @@ mod tests {
         let scored = parse_scored(doc);
         assert_eq!(scored.len(), 2, "both blocks must be scored");
 
-        let total: f64 = scored.iter().map(|(_, raw, corr)| wer(corr, raw)).sum();
+        let total: f64 = scored.iter().map(|b| wer(&b.corrected, &b.raw)).sum();
         // One block perfect, one with a single wrong word out of four.
         assert!((total / 2.0 - 0.125).abs() < 1e-9, "mean wer was {}", total / 2.0);
+    }
+
+    #[test]
+    fn parse_scored_reports_which_blocks_are_marked_reviewed() {
+        // Written by the correction viewer, one reviewed and confirmed
+        // correct without editing, one never opened yet.
+        let doc = "## 1 | t | 1s\n# reviewed: yes\n\nraw:\nthe orbit cli import\n\
+                   \n\ncorrected:\nthe orbit cli import\n\
+                   \n## 2 | t | 1s\n\nraw:\nthe orbit cli import\n\ncorrected:\nthe orbit cli import\n";
+        let scored = parse_scored(doc);
+        assert_eq!(scored.len(), 2, "parsing itself does not filter");
+        assert!(scored[0].reviewed);
+        assert!(!scored[1].reviewed, "no marker means not yet reviewed");
+    }
+
+    #[test]
+    fn parse_scored_never_assumes_reviewed_on_its_own() {
+        // No block carries "# reviewed: yes" — a file edited directly in a
+        // text editor, never opened in the viewer. Deciding that an absent
+        // marker everywhere means "score it all anyway" is the caller's
+        // call (the --score CLI handler), not this parser's — it just
+        // reports what it found.
+        let doc = "## 1 | t | 1s\n\nraw:\nthe orbit cli import\n\ncorrected:\nthe orbit cli import\n";
+        let scored = parse_scored(doc);
+        assert!(!scored[0].reviewed);
     }
 
     #[test]
@@ -303,6 +372,8 @@ mod tests {
             duration_s: Some(3.5),
             raw: "the orbits cli import".into(),
             corrected: None,
+            audio_path: None,
+            sentences_json: None,
         }];
         let doc = export(&samples);
         // Pre-filled with the raw text, so untouched blocks score as perfect.
@@ -311,6 +382,36 @@ mod tests {
         let edited = doc.replace("corrected:\nthe orbits cli import", "corrected:\nthe orbit cli import");
         let parsed = parse_import(&edited);
         assert_eq!(parsed, vec![(42, "the orbit cli import".to_string())]);
+    }
+
+    #[test]
+    fn export_carries_audio_and_timing_metadata_without_breaking_import() {
+        let samples = vec![Sample {
+            id: 9,
+            timestamp: "2026-09-08T10:00:00".into(),
+            duration_s: Some(2.4),
+            raw: "hi there. bye now.".into(),
+            corrected: None,
+            audio_path: Some("/tmp/ptt/ptt-123.wav".into()),
+            sentences_json: Some(
+                r#"[{"text":"hi there.","start":0.0,"end":1.2},{"text":"bye now.","start":1.2,"end":2.4}]"#
+                    .into(),
+            ),
+        }];
+        let doc = export(&samples);
+        assert!(doc.contains("# audio: /tmp/ptt/ptt-123.wav"));
+        assert!(doc.contains("# sentences: [{\"text\":\"hi there.\""));
+
+        // A correction tool reads the metadata; the plain importer must
+        // still see only the raw/corrected sections underneath it.
+        let edited = doc.replace(
+            "corrected:\nhi there. bye now.",
+            "corrected:\nhi there, bye now.",
+        );
+        assert_eq!(
+            parse_import(&edited),
+            vec![(9, "hi there, bye now.".to_string())]
+        );
     }
 
     #[test]

@@ -1802,6 +1802,7 @@ fn do_transcription(audio_path: &Path) -> TranscribeResult {
                 db::record(
                     &db, audio_path.to_str(), None, "empty",
                     Some(&err), Some(result.latency_s), Some(result.wps), Some(result.duration_s),
+                    None,
                 );
                 return TranscribeResult {
                     text: None, latency: result.latency_s,
@@ -1816,6 +1817,7 @@ fn do_transcription(audio_path: &Path) -> TranscribeResult {
                 db::record(
                     &db, audio_path.to_str(), Some(&result.text), "hallucination",
                     Some(&reason), Some(result.latency_s), Some(result.wps), Some(result.duration_s),
+                    None,
                 );
 
                 // Save hallucination transcript file
@@ -1842,6 +1844,7 @@ fn do_transcription(audio_path: &Path) -> TranscribeResult {
             db::record(
                 &db, audio_path.to_str(), Some(&result.text), "success",
                 None, Some(result.latency_s), Some(result.wps), Some(result.duration_s),
+                result.sentences_json.as_deref(),
             );
 
             // Save transcript file
@@ -1859,7 +1862,7 @@ fn do_transcription(audio_path: &Path) -> TranscribeResult {
         }
         Err(e) => {
             eprintln!("[ptt] Transcription error: {e}");
-            db::record(&db, audio_path.to_str(), None, "error", Some(&e), None, None, None);
+            db::record(&db, audio_path.to_str(), None, "error", Some(&e), None, None, None, None);
             let path_hint = audio_path.to_str().unwrap_or("unknown path");
             let msg = format!("{e} — recording saved: {path_hint}");
             TranscribeResult { text: None, latency: 0.0, error: Some(msg), hallucination: false }
@@ -1957,6 +1960,10 @@ fn main() {
         }
         ipc::CliAction::ExportDataset(path) => {
             let cfg = config::load();
+            // The CLI can run before the app ever has, or against a database
+            // last touched by an older binary — either way the schema must
+            // be current before querying it.
+            db::init(&cfg.db_path());
             let samples = eval::load_samples(&cfg.db_path(), 500);
             if samples.is_empty() {
                 eprintln!("No successful transcripts to export");
@@ -1980,6 +1987,7 @@ fn main() {
         }
         ipc::CliAction::ImportCorrections(path) => {
             let cfg = config::load();
+            db::init(&cfg.db_path());
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
@@ -2012,10 +2020,11 @@ fn main() {
         }
         ipc::CliAction::Score(path) => {
             let cfg = config::load();
+            db::init(&cfg.db_path());
             // Prefer an edited file: it carries every reviewed sample,
             // including the ones that needed no correction. Scoring from the
             // database alone would only see samples known to be wrong.
-            let scored: Vec<(i64, String, String)> = match &path {
+            let mut scored: Vec<eval::ScoredBlock> = match &path {
                 Some(p) => match std::fs::read_to_string(p) {
                     Ok(text) => eval::parse_scored(&text),
                     Err(e) => {
@@ -2025,12 +2034,36 @@ fn main() {
                 },
                 None => eval::load_samples(&cfg.db_path(), 5000)
                     .into_iter()
-                    .filter_map(|s| s.corrected.map(|c| (s.id, s.raw, c)))
+                    .filter_map(|s| {
+                        s.corrected.map(|c| eval::ScoredBlock {
+                            id: s.id,
+                            raw: s.raw,
+                            corrected: c,
+                            reviewed: true,
+                        })
+                    })
                     .collect(),
             };
             if scored.is_empty() {
                 eprintln!("Nothing to score — pass the edited file: --score <file>");
                 std::process::exit(1);
+            }
+            // "# reviewed: yes" (written by the HTML correction viewer, never
+            // by hand) disambiguates "confirmed correct" from "not looked at
+            // yet" for an untouched block. Only filter once at least one
+            // block carries the marker — a hand-edited file has none, and
+            // every block there still counts, as before.
+            if scored.iter().any(|b| b.reviewed) {
+                let total = scored.len();
+                scored.retain(|b| b.reviewed);
+                let skipped = total - scored.len();
+                if skipped > 0 {
+                    eprintln!("note: skipped {skipped} block(s) not yet marked reviewed\n");
+                }
+                if scored.is_empty() {
+                    eprintln!("Nothing to score — no blocks are marked reviewed yet");
+                    std::process::exit(1);
+                }
             }
             if path.is_none() {
                 eprintln!(
@@ -2044,16 +2077,16 @@ fn main() {
             let mut spurious: std::collections::HashMap<String, usize> = Default::default();
             let (mut sw, mut sc) = (0.0, 0.0);
             let (mut perfect, mut edited) = (0, 0);
-            for (_, raw, corrected) in &scored {
-                let w = eval::wer(corrected, raw);
+            for b in &scored {
+                let w = eval::wer(&b.corrected, &b.raw);
                 sw += w;
-                sc += eval::cer(corrected, raw);
+                sc += eval::cer(&b.corrected, &b.raw);
                 if w == 0.0 {
                     perfect += 1;
                 } else {
                     edited += 1;
                 }
-                let (m, sp) = eval::word_diff(corrected, raw);
+                let (m, sp) = eval::word_diff(&b.corrected, &b.raw);
                 for (k, v) in m {
                     *missing.entry(k).or_default() += v;
                 }

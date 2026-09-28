@@ -62,6 +62,10 @@ pub fn init(db_path: &Path) {
         )",
     )
     .expect("Failed to create table");
+    // Added after the table already existed for some users — CREATE TABLE IF
+    // NOT EXISTS above won't add it to those, and ALTER TABLE errors if the
+    // column is already there, so the failure is just ignored.
+    let _ = conn.execute("ALTER TABLE dictations ADD COLUMN sentences_json TEXT", []);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -74,13 +78,14 @@ pub fn record(
     latency: Option<f64>,
     wps: Option<f64>,
     duration: Option<f64>,
+    sentences_json: Option<&str>,
 ) {
     if let Ok(conn) = Connection::open(db_path) {
         let now = timestamp_now();
         let _ = conn.execute(
-            "INSERT INTO dictations (timestamp, audio_path, transcript, status, error_detail, latency_s, wps, duration_s)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![now, audio_path, transcript, status, error_detail, latency, wps, duration],
+            "INSERT INTO dictations (timestamp, audio_path, transcript, status, error_detail, latency_s, wps, duration_s, sentences_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![now, audio_path, transcript, status, error_detail, latency, wps, duration, sentences_json],
         );
     }
 }

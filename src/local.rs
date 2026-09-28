@@ -229,7 +229,7 @@ fn request(
     timeout_s: f64,
     chunk_duration_s: f64,
     chunk_overlap_s: f64,
-) -> Result<String, RequestError> {
+) -> Result<(String, Option<String>), RequestError> {
     let path = audio_path.to_str().ok_or_else(|| {
         RequestError::Rejected(format!(
             "audio path is not valid UTF-8: {}",
@@ -256,7 +256,14 @@ fn request(
     })?;
 
     if value["ok"].as_bool() == Some(true) {
-        Ok(value["text"].as_str().unwrap_or("").trim().to_string())
+        let text = value["text"].as_str().unwrap_or("").trim().to_string();
+        // Only kept when non-empty — an unaligned or pre-chunking sidecar
+        // response has no "sentences" field at all.
+        let sentences_json = value["sentences"]
+            .as_array()
+            .filter(|s| !s.is_empty())
+            .map(|s| serde_json::Value::Array(s.clone()).to_string());
+        Ok((text, sentences_json))
     } else {
         Err(RequestError::Rejected(
             value["error"]
@@ -293,7 +300,7 @@ pub fn transcribe(cfg: &LocalConfig, audio_path: &Path) -> Result<TranscriptionR
             cfg.chunk_duration_s,
             cfg.chunk_overlap_s,
         ) {
-            Ok(text) => {
+            Ok((text, sentences_json)) => {
                 // A decode that came back as mostly <unk> is transient: the
                 // same file has been observed transcribing correctly on a
                 // second attempt. Retry once here rather than handing the user
@@ -302,7 +309,9 @@ pub fn transcribe(cfg: &LocalConfig, audio_path: &Path) -> Result<TranscriptionR
                     eprintln!("[ptt] Decode came back as mostly <unk> — retrying once");
                     continue;
                 }
-                return Ok(crate::transcribe::build_result(text, start, audio_path));
+                let mut result = crate::transcribe::build_result(text, start, audio_path);
+                result.sentences_json = sentences_json;
+                return Ok(result);
             }
             Err(RequestError::Rejected(e)) => return Err(e),
             Err(RequestError::Broken(e)) => {
@@ -358,13 +367,42 @@ mod tests {
     /// A stand-in for `parakeet_mlx` so the protocol can be exercised without
     /// downloading 2.5 GB of weights.
     const STUB_MODULE: &str = r#"
+class _Sentence:
+    def __init__(self, text, start, end): self.text, self.start, self.end = text, start, end
+
+class _Token:
+    def __init__(self, text, start, end): self.text, self.start, self.end = text, start, end
+
 class _Result:
-    def __init__(self, text): self.text = text
+    def __init__(self, text, sentences=None, tokens=None):
+        self.text, self.sentences, self.tokens = text, sentences or [], tokens or []
 
 class _Model:
     def transcribe(self, path, chunk_duration=None, overlap_duration=15.0):
         if "silence" in path: return _Result("   ")
         if "boom" in path: raise RuntimeError("decode failed")
+        if "timed" in path:
+            return _Result("hi there. bye now.", [_Sentence("hi there.", 0.0, 1.2), _Sentence("bye now.", 1.2, 2.4)])
+        if "paused" in path:
+            # A 3s gap before "there", and a 0.4s one before "now" — only
+            # the first should turn into extra spaces.
+            return _Result("hi there. bye now.", tokens=[
+                _Token(" hi", 0.0, 0.3), _Token(" there", 3.3, 3.6), _Token(".", 3.6, 3.7),
+                _Token(" bye", 3.7, 4.0), _Token(" now", 4.4, 4.7), _Token(".", 4.7, 4.8),
+            ])
+        # transcribe_with_silence_splits calls back in with each split
+        # segment's own temp file, not the original path, so a real wav
+        # (unlike this test module's other, nonexistent fixture paths) is
+        # told apart by its own duration instead of by path matching.
+        try:
+            import wave
+            with wave.open(path, "rb") as w:
+                duration = w.getnframes() / w.getframerate()
+            if duration > 3.0:
+                return _Result("before", tokens=[_Token(" before", 0.0, 0.3)])
+            return _Result("after", tokens=[_Token(" after", 0.0, 0.3)])
+        except Exception:
+            pass
         return _Result("  hello from the stub  ")
 
 def from_pretrained(model_id):
@@ -387,6 +425,43 @@ def from_pretrained(model_id):
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    /// find_silence_splits needs numpy on the bare `python3` the tests spawn
+    /// (not the `uv run --with parakeet-mlx` launcher real dictation uses,
+    /// which always has it as parakeet-mlx's own dependency).
+    fn python_has_numpy() -> bool {
+        Command::new("python3")
+            .arg("-c")
+            .arg("import numpy")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Write a minimal 16-bit mono PCM WAV file — enough for
+    /// `find_silence_splits` to read back with Python's `wave` module.
+    fn write_test_wav(path: &Path, samples: &[i16], sample_rate: u32) {
+        let data_len = (samples.len() * 2) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // block align
+        bytes.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
     }
 
     /// Lay out a throwaway directory holding the sidecar script and a stub
@@ -424,12 +499,12 @@ def from_pretrained(model_id):
 
         // Transcripts come back trimmed.
         assert_eq!(
-            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0, 60.0, 15.0).unwrap(),
+            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0, 60.0, 15.0).unwrap().0,
             "hello from the stub"
         );
         // Silence yields empty text, not invented speech — and not an error.
         assert_eq!(
-            request(&mut sidecar, Path::new("/tmp/silence.wav"), 30.0, 60.0, 15.0).unwrap(),
+            request(&mut sidecar, Path::new("/tmp/silence.wav"), 30.0, 60.0, 15.0).unwrap().0,
             ""
         );
         // A per-request failure is reported as Rejected, so the caller keeps
@@ -442,9 +517,71 @@ def from_pretrained(model_id):
         assert!(err.contains("decode failed"), "unexpected error: {err}");
         // ...so the next request still works.
         assert_eq!(
-            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0, 60.0, 15.0).unwrap(),
+            request(&mut sidecar, Path::new("/tmp/speech.wav"), 30.0, 60.0, 15.0).unwrap().0,
             "hello from the stub"
         );
+
+        // Sentence timing round-trips as a JSON array, for a correction tool
+        // to seek audio by sentence.
+        let (text, sentences_json) =
+            request(&mut sidecar, Path::new("/tmp/timed.wav"), 30.0, 60.0, 15.0).unwrap();
+        assert_eq!(text, "hi there. bye now.");
+        let sentences: serde_json::Value =
+            serde_json::from_str(&sentences_json.expect("timed audio must carry sentences")).unwrap();
+        assert_eq!(sentences[0]["text"], "hi there.");
+        assert_eq!(sentences[0]["start"], 0.0);
+        assert_eq!(sentences[1]["end"], 2.4);
+
+        // A gap of a whole second or more between words comes back as that
+        // many extra spaces — a shorter gap (the one before "now") does not.
+        let (text, _) =
+            request(&mut sidecar, Path::new("/tmp/paused.wav"), 30.0, 60.0, 15.0).unwrap();
+        assert_eq!(text, "hi    there. bye now.");
+
+        // Silence has no sentences to report, not an empty-but-present array.
+        assert!(
+            request(&mut sidecar, Path::new("/tmp/silence.wav"), 30.0, 60.0, 15.0)
+                .unwrap()
+                .1
+                .is_none()
+        );
+
+        sidecar.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn splits_a_long_internal_silence_and_recombines_with_a_pause() {
+        if !python_available() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        if !python_has_numpy() {
+            eprintln!("skipping: numpy not available on the bare python3 these tests spawn");
+            return;
+        }
+        let (dir, cfg) = stub_env("long-silence", STUB_MODULE);
+        let mut sidecar = spawn_with_script(&cfg, &dir.join(SIDECAR_FILE)).unwrap();
+
+        // 1s of signal, 8s of true digital silence, 1s of signal — a real
+        // reproduction (see #2672 in the app's own history) found real
+        // speech dropped immediately after an 11s silence in one unbroken
+        // decode. This is the shape that must trigger a split (above
+        // MIN_SILENCE_S, currently 7s).
+        let sample_rate = 16_000u32;
+        let tone: Vec<i16> = (0..sample_rate).map(|i| if i % 2 == 0 { 3000 } else { -3000 }).collect();
+        let silence: Vec<i16> = vec![0; (sample_rate * 8) as usize];
+        let mut samples = tone.clone();
+        samples.extend(&silence);
+        samples.extend(&tone);
+        let wav_path = dir.join("original.wav");
+        write_test_wav(&wav_path, &samples, sample_rate);
+
+        let (text, _) = request(&mut sidecar, &wav_path, 30.0, 60.0, 15.0).unwrap();
+        // The stub tells the two split segments apart by their own real
+        // duration (~8.5s and ~1.5s) and the ~8.2s gap between them comes
+        // back encoded as extra spaces, same as any other pause.
+        assert_eq!(text, format!("before{}after", " ".repeat(9)));
 
         sidecar.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

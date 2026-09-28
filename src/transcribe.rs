@@ -147,6 +147,9 @@ pub struct TranscriptionResult {
     pub latency_s: f64,
     pub wps: f64,
     pub duration_s: f64,
+    /// Sentence-level timing as a JSON array (`[{"text","start","end"}, ...]`),
+    /// when the backend that produced `text` could align it to the audio.
+    pub sentences_json: Option<String>,
 }
 
 /// Assemble a [`TranscriptionResult`], deriving latency from `start` and
@@ -161,7 +164,7 @@ pub fn build_result(
     let duration_s = crate::audio::get_duration(audio_path).unwrap_or(0.0);
     let word_count = text.split_whitespace().count() as f64;
     let wps = if duration_s > 0.0 { word_count / duration_s } else { 0.0 };
-    TranscriptionResult { text, latency_s, wps, duration_s }
+    TranscriptionResult { text, latency_s, wps, duration_s, sentences_json: None }
 }
 
 /// Build the system prompt for transcription.

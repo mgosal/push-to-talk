@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Parakeet correction viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f5;
+    --card: #ffffff;
+    --border: #ddd;
+    --text: #1a1a1a;
+    --muted: #737373;
+    --accent: #2563eb;
+    --accent-bg: #dbeafe;
+    --edited: #15803d;
+    --edited-bg: #dcfce7;
+    --whisper: #7e22ce;
+    --whisper-bg: #f3e8ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a;
+      --card: #232427;
+      --border: #3a3b3e;
+      --text: #eaeaea;
+      --muted: #9a9a9a;
+      --accent: #60a5fa;
+      --accent-bg: #1e3a5f;
+      --edited: #4ade80;
+      --edited-bg: #143221;
+      --whisper: #c084fc;
+      --whisper-bg: #2e1a47;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  header .stats { color: var(--muted); font-variant-numeric: tabular-nums; }
+  button, input[type=file]::file-selector-button {
+    font: inherit;
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button:hover, input[type=file]::file-selector-button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+  main { max-width: 760px; margin: 0 auto; padding: 20px; }
+  .empty { color: var(--muted); text-align: center; padding: 60px 20px; }
+  .empty code { background: var(--accent-bg); padding: 2px 6px; border-radius: 4px; }
+  .block {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 14px;
+  }
+  .block.edited { border-left: 3px solid var(--edited); }
+  .block-head {
+    display: flex;
+    justify-content: space-between;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--edited-bg);
+    color: var(--edited);
+    margin-left: 6px;
+  }
+  .badge.reviewed { background: var(--accent-bg); color: var(--accent); }
+  .badge.whispered { background: var(--whisper-bg); color: var(--whisper); }
+  .confirm-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .confirm-row input { cursor: pointer; }
+  .confirm-row input:disabled { cursor: default; }
+  audio { width: 100%; height: 32px; margin-bottom: 10px; }
+  .sentences { margin-bottom: 10px; }
+  .sentences span {
+    cursor: pointer;
+    border-radius: 3px;
+    padding: 0 1px;
+  }
+  .sentences span:hover { background: var(--accent-bg); }
+  .sentences span.playing { background: var(--accent); color: white; }
+  .raw-plain { color: var(--muted); }
+  textarea {
+    width: 100%;
+    font: inherit;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    resize: vertical;
+    min-height: 44px;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .no-audio-note {
+    color: var(--muted);
+    font-style: italic;
+    margin-bottom: 8px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Parakeet correction viewer</h1>
+  <input id="file-input" type="file" accept=".md">
+  <button id="pick-folder">Choose recordings folder</button>
+  <span class="stats" id="stats"></span>
+  <span class="spacer"></span>
+  <button id="download" class="primary" disabled>Download corrected .md</button>
+  <input id="folder-input" type="file" webkitdirectory multiple hidden>
+</header>
+<main id="main">
+  <div class="empty">
+    Open a file exported with <code>push-to-talk --export-dataset &lt;file&gt;</code>.<br>
+    Blocks that carry a recorded audio path get an inline player; click a sentence
+    to jump the audio to its start.<br><br>
+    If playback says a recording is missing, click <strong>Choose recordings
+    folder</strong> and pick the folder the paths live in (e.g. the <code>ptt</code>
+    folder under your temp directory) — browsers block pages from loading local
+    files by path directly, so this grants access explicitly instead.
+  </div>
+</main>
+<script>
+"use strict";
+
+// Mirrors src/eval.rs's parse_scored(): a "## id | ts | dur" line starts a
+// block, "raw:"/"corrected:" switch sections, any other line starting with
+// "#" (the header, or this tool's own "# audio:"/"# sentences:" metadata) is
+// ignored. Kept in lockstep with the Rust parser so a block header this tool
+// can't make sense of still round-trips through --import-corrections.
+function parseExport(text) {
+  const blocks = [];
+  let id = null, timestamp = "", duration = "", audio = null, sentences = null;
+  let reviewed = false, whispered = false;
+  let section = null;
+  let raw = [], corrected = [];
+
+  function flush() {
+    if (id !== null && !Number.isNaN(id)) {
+      const r = raw.join("\n").trim();
+      const c = corrected.join("\n").trim();
+      if (r) blocks.push({ id, timestamp, duration, audio, sentences, reviewed, whispered, raw: r, corrected: c });
+    }
+    raw = []; corrected = []; audio = null; sentences = null;
+    reviewed = false; whispered = false; section = null;
+  }
+
+  for (const line of text.split("\n")) {
+    if (line.startsWith("## ")) {
+      flush();
+      const parts = line.slice(3).split("|").map((s) => s.trim());
+      id = parseInt(parts[0], 10);
+      timestamp = parts[1] || "";
+      duration = parts[2] || "";
+    } else if (line.startsWith("# audio: ")) {
+      audio = line.slice("# audio: ".length).trim();
+    } else if (line.startsWith("# sentences: ")) {
+      try {
+        sentences = JSON.parse(line.slice("# sentences: ".length));
+      } catch {
+        sentences = null;
+      }
+    } else if (line.trim() === "# reviewed: yes") {
+      reviewed = true;
+    } else if (line.trim() === "# whispered: yes") {
+      whispered = true;
+    } else if (line.trim() === "raw:") {
+      section = "raw";
+    } else if (line.trim() === "corrected:") {
+      section = "corrected";
+    } else if (!line.startsWith("#")) {
+      if (section === "raw") raw.push(line);
+      else if (section === "corrected") corrected.push(line);
+    }
+  }
+  flush();
+  return blocks;
+}
+
+// The inverse of parseExport, matching eval::export()'s layout exactly so
+// the result re-imports cleanly.
+const HEADER = `# Transcription evaluation set
+#
+# Each block below is one dictation. The `+"`corrected:`"+` section is pre-filled
+# with exactly what Parakeet produced — edit it so it says what you actually
+# said, and leave the rest alone. Blocks you do not touch score as perfect,
+# so it is safe to correct only the ones that are wrong and skip the others.
+#
+# Do not edit the `+"`## id`"+` lines or the `+"`raw:`"+` sections: the importer matches
+# on the id, and `+"`raw:`"+` is the record of what the model produced.
+#
+# Re-import with:  push-to-talk --import-corrections <this file>
+`;
+
+function serializeExport(blocks) {
+  let out = HEADER;
+  for (const b of blocks) {
+    out += `\n## ${b.id} | ${b.timestamp} | ${b.duration}\n`;
+    if (b.audio) out += `# audio: ${b.audio}\n`;
+    if (b.sentences) out += `# sentences: ${JSON.stringify(b.sentences)}\n`;
+    // An edit is inherently a review; "# reviewed: yes" additionally covers
+    // a block confirmed correct as-is, via the checkbox, without editing —
+    // --score treats the two the same once any block in the file has it.
+    if (b.reviewed || b.corrected.trim() !== b.raw.trim()) out += `# reviewed: yes\n`;
+    if (b.whispered) out += `# whispered: yes\n`;
+    out += `\nraw:\n${b.raw}\n\ncorrected:\n${b.corrected.trim()}\n`;
+  }
+  return out;
+}
+
+function audioFileUrl(path) {
+  // Absolute local paths from the database, turned into a file:// URL an
+  // <audio> element can load directly — no server involved. Both Safari and
+  // Chrome sandbox file:// pages against loading arbitrary local files by
+  // path, so this is a best-effort attempt only; recordingsByName (below) is
+  // the reliable path, once the user grants folder access.
+  return "file://" + path.split("/").map(encodeURIComponent).join("/");
+}
+
+let blocks = [];
+// basename -> File, populated once the user picks the recordings folder.
+// Loading files this way carries an explicit OS-level grant that a bare
+// file:// src does not, which is what actually fixes playback — re-render()
+// picks it up for every block at once.
+let recordingsByName = new Map();
+
+function resolveAudioSrc(path) {
+  const name = path.split("/").pop();
+  const file = recordingsByName.get(name);
+  return file ? URL.createObjectURL(file) : audioFileUrl(path);
+}
+
+function wireAudioElement(audioEl, path) {
+  audioEl.onerror = () => {
+    const name = path.split("/").pop();
+    const note = document.createElement("div");
+    note.className = "no-audio-note";
+    note.textContent = recordingsByName.size
+      ? `"${name}" was not found in the folder you selected.`
+      : `Could not load this recording directly (browsers block that). Click "Choose recordings folder" above and select the folder it lives in.`;
+    audioEl.replaceWith(note);
+  };
+  audioEl.src = resolveAudioSrc(path);
+}
+
+function isEdited(b) {
+  return b.corrected.trim() !== b.raw.trim();
+}
+function isReviewed(b) {
+  // Editing a block is itself a review; the checkbox only needs to cover
+  // "looked at it, it was already right" — the case that leaves no trace
+  // in the text.
+  return b.reviewed || isEdited(b);
+}
+
+function updateStats() {
+  const edited = blocks.filter(isEdited).length;
+  const reviewed = blocks.filter(isReviewed).length;
+  document.getElementById("stats").textContent = blocks.length
+    ? `${reviewed} / ${blocks.length} reviewed · ${edited} edited`
+    : "";
+  document.getElementById("download").disabled = blocks.length === 0;
+}
+
+function render() {
+  const main = document.getElementById("main");
+  main.innerHTML = "";
+  if (!blocks.length) {
+    main.innerHTML = '<div class="empty">No blocks parsed from that file.</div>';
+    return;
+  }
+
+  for (const b of blocks) {
+    const card = document.createElement("div");
+    card.className = "block";
+
+    const head = document.createElement("div");
+    head.className = "block-head";
+    head.innerHTML = `<span>#${b.id} · ${b.timestamp} · ${b.duration}</span><span class="edit-badge"></span>`;
+    card.appendChild(head);
+
+    let audioEl = null;
+    if (b.audio) {
+      audioEl = document.createElement("audio");
+      audioEl.controls = true;
+      audioEl.preload = "none";
+      wireAudioElement(audioEl, b.audio);
+      card.appendChild(audioEl);
+    }
+
+    const sentWrap = document.createElement("div");
+    sentWrap.className = "sentences";
+    if (b.sentences && b.sentences.length && audioEl) {
+      const spans = [];
+      b.sentences.forEach((s) => {
+        const span = document.createElement("span");
+        span.textContent = s.text + " ";
+        span.title = `${s.start.toFixed(1)}s – ${s.end.toFixed(1)}s (click to play from here)`;
+        span.addEventListener("click", () => {
+          audioEl.currentTime = s.start;
+          audioEl.play();
+        });
+        sentWrap.appendChild(span);
+        spans.push({ span, start: s.start, end: s.end });
+      });
+      audioEl.addEventListener("timeupdate", () => {
+        const t = audioEl.currentTime;
+        for (const { span, start, end } of spans) {
+          span.classList.toggle("playing", t >= start && t < end);
+        }
+      });
+    } else {
+      sentWrap.className = "sentences raw-plain";
+      sentWrap.textContent = b.raw;
+    }
+    card.appendChild(sentWrap);
+
+    const textarea = document.createElement("textarea");
+    textarea.value = b.corrected;
+    textarea.rows = Math.max(2, Math.ceil(b.corrected.length / 70));
+    const badge = head.querySelector(".edit-badge");
+
+    const confirmRow = document.createElement("label");
+    confirmRow.className = "confirm-row";
+    const confirmBox = document.createElement("input");
+    confirmBox.type = "checkbox";
+    confirmRow.appendChild(confirmBox);
+    confirmRow.appendChild(document.createTextNode(" No correction needed — confirmed correct as-is"));
+
+    // Manual for now — no auto-detection. Whispering has no vocal-fold
+    // pitch, so it's a real acoustic signal a separate pass over the raw
+    // audio (not Parakeet's text output) could pick up on later; until
+    // then this is just a place to record it while listening.
+    const whisperRow = document.createElement("label");
+    whisperRow.className = "confirm-row";
+    const whisperBox = document.createElement("input");
+    whisperBox.type = "checkbox";
+    whisperBox.checked = b.whispered;
+    whisperRow.appendChild(whisperBox);
+    whisperRow.appendChild(document.createTextNode(" Whispered"));
+
+    function refresh() {
+      b.corrected = textarea.value;
+      const edited = isEdited(b);
+      confirmBox.checked = edited || b.reviewed;
+      // An edit already proves review; the checkbox would just be a
+      // second, redundant source of truth for the same block.
+      confirmBox.disabled = edited;
+      card.classList.toggle("edited", edited);
+      badge.innerHTML = edited
+        ? '<span class="badge">edited</span>'
+        : b.reviewed
+          ? '<span class="badge reviewed">reviewed</span>'
+          : "";
+      if (b.whispered) badge.innerHTML += ' <span class="badge whispered">whispered</span>';
+      updateStats();
+    }
+    textarea.addEventListener("input", refresh);
+    confirmBox.addEventListener("change", () => {
+      b.reviewed = confirmBox.checked;
+      refresh();
+    });
+    whisperBox.addEventListener("change", () => {
+      b.whispered = whisperBox.checked;
+      refresh();
+    });
+    refresh();
+    card.appendChild(textarea);
+    card.appendChild(confirmRow);
+    card.appendChild(whisperRow);
+
+    main.appendChild(card);
+  }
+}
+
+document.getElementById("file-input").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  file.text().then((text) => {
+    blocks = parseExport(text);
+    render();
+    updateStats();
+  });
+});
+
+document.getElementById("pick-folder").addEventListener("click", () => {
+  document.getElementById("folder-input").click();
+});
+
+document.getElementById("folder-input").addEventListener("change", (e) => {
+  recordingsByName = new Map();
+  for (const file of e.target.files) {
+    recordingsByName.set(file.name, file);
+  }
+  // Every block's audio source is re-resolved against the newly granted
+  // folder, so already-rendered blocks are fixed without re-opening the .md.
+  render();
+});
+
+document.getElementById("download").addEventListener("click", () => {
+  const blob = new Blob([serializeExport(blocks)], { type: "text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "transcription-eval.corrected.md";
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+</script>
+</body>
+</html>

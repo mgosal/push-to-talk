@@ -22,3 +22,5 @@ transcription-eval*.md
 *groundtruth*.md
 *.eval.md
 eval-*.md
+__pycache__/
+*.pyc
